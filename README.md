@@ -85,6 +85,30 @@ A typical cron setup:
 0  3  * * 0   ~/.local/bin/undrudge analyze --meta --window 7d
 ```
 
+### macOS: prefer launchd, or grant cron Full Disk Access
+
+Cron on macOS will silently fail to read your atuin DB and Claude
+projects directory unless `/usr/sbin/cron` has Full Disk Access — the
+symptom is `sqlite3.OperationalError: unable to open database file`
+even though the file is right there and owned by you. To grant it:
+System Settings → Privacy & Security → Full Disk Access → `+` →
+press `⌘⇧G` → `/usr/sbin/cron` → enable.
+
+The cleaner option is launchd, which runs your job in your normal
+user session and doesn't need a Full Disk Access grant. Templates
+ship in `scripts/launchd/`:
+
+```bash
+./scripts/launchd/install.sh
+```
+
+This renders the three plists with your `$HOME`, copies them to
+`~/Library/LaunchAgents/`, and bootstraps them via `launchctl`. Edit
+the plists in the repo and re-run the script to change schedules.
+Logs go to `~/.local/share/undrudge/logs/{gather,analyze,analyze-meta}.log`.
+The script prints removal and on-demand-run commands at the end of a
+successful install.
+
 ## Recommendation format
 
 Each recommendation is a single markdown file with JSON frontmatter:
