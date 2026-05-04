@@ -1,0 +1,63 @@
+[project]
+name = "undrudge"
+version = "0.1.0"
+description = "Background watchman that finds what to automate in your Claude Code + shell activity."
+requires-python = ">=3.12"
+authors = [{ name = "Vlad Orlenko", email = "vlad@orlenko.ca" }]
+readme = "README.md"
+license = { text = "MIT" }
+keywords = ["automation", "claude", "claude-code", "shell", "atuin", "productivity"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development",
+  "Topic :: Utilities",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/orlenko/undrudge"
+Repository = "https://github.com/orlenko/undrudge"
+Issues = "https://github.com/orlenko/undrudge/issues"
+
+[project.scripts]
+undrudge = "undrudge.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/undrudge"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/undrudge/schema.sql" = "undrudge/schema.sql"
+"src/undrudge/prompts" = "undrudge/prompts"
+"src/undrudge/scripts" = "undrudge/scripts"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.5",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "RUF", "SIM"]
+# RUF001/003: × and ˋ are intentional in rendered digest output (×7, ˋfooˋ
+# code-fence stand-ins) — they read better than ASCII equivalents and the
+# unicode-confusable warning is noise here.
+ignore = ["E501", "RUF001", "RUF003"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
