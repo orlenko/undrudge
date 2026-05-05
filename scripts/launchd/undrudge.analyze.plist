@@ -20,6 +20,12 @@
         <integer>30</integer>
     </dict>
 
+    <!-- launchd defaults cwd to "/" — set it to $HOME so any subprocess
+         that doesn't override cwd (or any --allow-cwd grant) lands in a
+         sensible place. -->
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>

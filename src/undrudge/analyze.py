@@ -113,10 +113,15 @@ class FileBasedInvoker:
         )
 
         with stderr_file.open("wb") as err_fp:
+            # cwd matters: the bundled nono wrapper grants `--allow-cwd`,
+            # and launchd starts agents in `/` by default. Without an
+            # explicit cwd nono would be asked to allow `/`, which it
+            # refuses because it overlaps `~/.nono`.
             proc = subprocess.Popen(
                 [*self.command_argv, "-p", instruction],
                 stdout=subprocess.DEVNULL,
                 stderr=err_fp,
+                cwd=self.workdir,
             )
 
             deadline = time.time() + self.timeout
