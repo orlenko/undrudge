@@ -337,15 +337,16 @@ def test_write_skips_empty_signature(tmp_path: Path):
 
 
 def test_write_fires_on_write_hook(tmp_path: Path):
+    """on_write is run through /bin/sh -c with the rec path bound to $1."""
     conn = store.init(tmp_path / "u.sqlite")
     sentinel = tmp_path / "hook.touch"
-    hook = tmp_path / "hook.sh"
-    hook.write_text(f"#!/usr/bin/env bash\necho \"$1\" > {sentinel}\n")
-    hook.chmod(0o755)
 
     rec = recommend.Recommendation(title="x", body_markdown="b", signature="sig")
     result = recommend.write(
-        conn, rec, recs_dir=tmp_path / "recs", on_write=str(hook)
+        conn,
+        rec,
+        recs_dir=tmp_path / "recs",
+        on_write=f'echo "$1" > {sentinel}',
     )
     assert result.inserted is True
     assert sentinel.exists()

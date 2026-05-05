@@ -167,7 +167,10 @@ timeout_seconds = {cfg.llm.timeout_seconds}
 
 [output]
 # Optional shell command run after each recommendation is written.
-# Receives the absolute path of the new .md file as $1.
+# Executed under /bin/sh -c, with the absolute path of the new .md
+# file bound to $1 (and to "$@"). Examples:
+#   on_write = 'cp "$1" ~/notes/undrudge/'
+#   on_write = '~/bin/notify-undrudge "$1"'
 on_write = ""
 
 [privacy]

@@ -15,7 +15,6 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import sqlite3
 import subprocess
 from collections.abc import Iterable
@@ -253,8 +252,11 @@ def write(
 
     if on_write:
         try:
+            # Run the hook through /bin/sh so users can write things like
+            # `cp "$1" /some/dir/` in config.toml — the path is bound to
+            # `$1` (and "$@"). The placeholder "_" fills $0 so $1 lines up.
             subprocess.run(
-                [*shlex.split(on_write), str(path)],
+                ["/bin/sh", "-c", on_write, "_", str(path)],
                 check=False,
                 timeout=30,
                 env=os.environ.copy(),
