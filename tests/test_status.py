@@ -99,8 +99,40 @@ def test_set_status_implemented_rewrites_frontmatter(tmp_path: Path):
     assert update.body_path.exists()
 
     text = update.body_path.read_text()
-    fm = json.loads(text.split("---\n", 2)[1])
+    assert text.startswith("```json\n")
+    fm = json.loads(text.split("```\n", 2)[0].removeprefix("```json\n"))
     assert fm["status"] == "implemented"
+
+
+def test_set_status_migrates_legacy_dash_fence(tmp_path: Path):
+    """A rec written before the ```json change uses --- fences;
+    set_status reads it correctly and migrates the file to the new fence."""
+    conn = store.init(tmp_path / "u.sqlite")
+    seeded = _seed(conn, tmp_path / "recs")
+    target = seeded[0]
+
+    # Rewrite the on-disk file in the legacy --- format. Keep the same
+    # JSON payload the writer produced so set_status's read path is the
+    # only thing under test.
+    body_path = Path(
+        conn.execute(
+            "SELECT body_path FROM recommendations WHERE id = ?",
+            (target.fingerprint,),
+        ).fetchone()[0]
+    )
+    text = body_path.read_text()
+    parts = text.split("```\n", 2)
+    head = parts[0].removeprefix("```json\n").rstrip("\n")
+    rest = parts[1]
+    body_path.write_text(f"---\n{head}\n---\n{rest}")
+
+    update = recommend.set_status(conn, target.fingerprint, "dismissed")
+    assert update.body_path is not None
+
+    new_text = update.body_path.read_text()
+    assert new_text.startswith("```json\n")
+    fm = json.loads(new_text.split("```\n", 2)[0].removeprefix("```json\n"))
+    assert fm["status"] == "dismissed"
 
 
 def test_set_status_no_match(tmp_path: Path):

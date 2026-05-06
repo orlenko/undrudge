@@ -296,8 +296,8 @@ def test_write_persists_markdown_and_db(tmp_path: Path):
 
     text = result.path.read_text()
     assert "Wrap repeated find/grep" in text
-    assert text.startswith("---\n")
-    fm = json.loads(text.split("---\n", 2)[1])
+    assert text.startswith("```json\n")
+    fm = json.loads(text.split("```\n", 2)[0].removeprefix("```json\n"))
     assert fm["id"] == result.fingerprint
     assert fm["status"] == "logged"
     assert fm["confidence"] == "high"

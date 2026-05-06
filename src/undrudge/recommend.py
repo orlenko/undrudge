@@ -155,7 +155,10 @@ def _frontmatter(rec: Recommendation, *, fingerprint: str, created: datetime) ->
     if rec.rationale:
         payload["rationale"] = rec.rationale
     body = json.dumps(payload, indent=2, default=str, ensure_ascii=False)
-    return f"---\n{body}\n---\n"
+    # Fence as a ```json code block rather than YAML-style ---. The
+    # payload is JSON, and bare --- gets rendered by some markdown
+    # viewers as an H2 underline applied to the line above.
+    return f"```json\n{body}\n```\n"
 
 
 def render_markdown(rec: Recommendation, *, fingerprint: str, created: datetime) -> str:
@@ -392,15 +395,25 @@ def set_status(
 
 
 def _rewrite_frontmatter_status(path: Path, new_status: str) -> None:
+    """Update the ``status`` field in a rec file's JSON header in-place.
+
+    Reads either the current ```json fence or the legacy YAML-style
+    ``---`` fence (recs written before that change). Always writes back
+    in the new format, so updates passively migrate old files.
+    """
     text = path.read_text()
-    if not text.startswith("---\n"):
+    if text.startswith("```json\n"):
+        open_len, close_marker = len("```json\n"), "\n```\n"
+    elif text.startswith("---\n"):
+        open_len, close_marker = len("---\n"), "\n---\n"
+    else:
         return
-    end = text.find("\n---\n", 4)
+    end = text.find(close_marker, open_len)
     if end < 0:
         return
-    head = text[4:end]
-    rest = text[end + 5 :]
+    head = text[open_len:end]
+    rest = text[end + len(close_marker):]
     fm = json.loads(head)
     fm["status"] = new_status
     new_head = json.dumps(fm, indent=2, default=str, ensure_ascii=False)
-    path.write_text(f"---\n{new_head}\n---\n{rest}")
+    path.write_text(f"```json\n{new_head}\n```\n{rest}")

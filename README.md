@@ -113,10 +113,10 @@ successful install.
 
 ## Recommendation format
 
-Each recommendation is a single markdown file with JSON frontmatter:
+Each recommendation is a single markdown file with a JSON header:
 
-```markdown
----
+````markdown
+```json
 {
   "id": "7f3a91...",
   "scope": "daily",
@@ -127,13 +127,13 @@ Each recommendation is a single markdown file with JSON frontmatter:
   "signature": "find . -name <str> | xargs grep <str>",
   "evidence": [...]
 }
----
+```
 
 # Wrap repeated find/xargs grep into a slash command
 
 You ran the same `find . -name '*.py' | xargs grep ...` skeleton 7 times
 across 3 sessions this week. ...
-```
+````
 
 To dismiss: edit the frontmatter `status: dismissed`, or run `undrudge
 dismiss <id>`.
