@@ -31,6 +31,7 @@ ROWS="$(tput lines 2>/dev/null || echo 24)"
 exec nono run \
   --allow-cwd \
   --allow "$HOME/.claude" \
+  --allow "$HOME/.claude.lock" \
   --allow "$HOME/.local/share/claude" \
   --allow "$HOME/.local/state/claude" \
   --allow "$HOME/.local/share/undrudge" \
