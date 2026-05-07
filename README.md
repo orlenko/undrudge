@@ -4,8 +4,15 @@
 
 
 A background watchman that watches what you do in Claude Code and your
-shell, finds the parts that look like muscle memory, and writes
-recommendations to disk for you to read at your leisure.
+shell, spots the chores you keep redoing by hand instead of factoring
+out, and writes recommendations to disk for you to read at your leisure.
+
+The point isn't to surface things you're good at — it's to surface
+things you (or your agents) are quietly *suffering*: the same shell
+compound retyped seven times this week, the same prompt skeleton
+pasted across sessions, the same six-line workaround for a missing
+helper. Carrying the same box from table to shelf twenty times a day
+when you could just rearrange the room.
 
 I built undrudge for myself, after noticing that I kept retyping the
 same shell compounds and pasting the same prompts across sessions. It
