@@ -185,7 +185,7 @@ def test_shell_ingest_redacts_secret_in_command(db, atuin_db: Path):
 
 
 def test_shell_ingest_idempotent(db, atuin_db: Path):
-    first = ingest_shell.ingest(db, atuin_db)
+    ingest_shell.ingest(db, atuin_db)
     second = ingest_shell.ingest(db, atuin_db)
     assert second.rows_inserted == 0
 
