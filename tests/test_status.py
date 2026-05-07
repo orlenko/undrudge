@@ -30,6 +30,98 @@ def _seed(conn: sqlite3.Connection, recs_dir: Path) -> list[recommend.WriteResul
     return out
 
 
+def _seed_evidence_rows(conn: sqlite3.Connection) -> tuple[str, str]:
+    """Insert one shell command and one claude message; return their ids."""
+    conn.execute(
+        "INSERT INTO commands(source, external_id, ts, command) VALUES (?, ?, ?, ?)",
+        ("atuin", "abc12345-9999-aaaa-bbbb-cccccccccccc", 1, "ls"),
+    )
+    conn.execute(
+        "INSERT INTO sessions(id, project, started_at, last_seen) "
+        "VALUES (?, ?, ?, ?)",
+        ("ses-1", "/x", 1, 1),
+    )
+    conn.execute(
+        "INSERT INTO messages(id, session_id, seq, ts, role, text) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("def67890-1111-2222-3333-444444444444", "ses-1", 0, 1, "user", "hi"),
+    )
+    return ("abc12345-9999-aaaa-bbbb-cccccccccccc",
+            "def67890-1111-2222-3333-444444444444")
+
+
+def test_resolve_evidence_refs_counts_unique_prefix_matches(tmp_path: Path):
+    conn = store.init(tmp_path / "u.sqlite")
+    _seed_evidence_rows(conn)
+    refs = [
+        {"source": "atuin",  "external_id": "abc12345"},   # 8-char handle, hits
+        {"source": "claude", "external_id": "def67890"},   # 8-char handle, hits
+        {"source": "atuin",  "external_id": "ffffffff"},   # no row, miss
+        {"source": "claude", "external_id": ""},           # malformed, drop entirely
+        {"source": "weird",  "external_id": "abc"},        # unknown source, drop
+        "not even a dict",                                 # drop
+    ]
+    resolved, total = recommend.resolve_evidence_refs(conn, refs)
+    # Two well-formed refs hit, one well-formed ref missed.
+    assert (resolved, total) == (2, 3)
+
+
+def test_resolve_evidence_refs_strips_dashes_in_handles(tmp_path: Path):
+    conn = store.init(tmp_path / "u.sqlite")
+    _seed_evidence_rows(conn)
+    # Some LLMs may parrot the dashes back; the resolver should still match.
+    refs = [{"source": "claude", "external_id": "def6-7890"}]
+    resolved, total = recommend.resolve_evidence_refs(conn, refs)
+    assert (resolved, total) == (1, 1)
+
+
+def test_resolve_evidence_refs_treats_ambiguous_prefix_as_unresolved(
+    tmp_path: Path,
+):
+    conn = store.init(tmp_path / "u.sqlite")
+    # Two commands sharing a short prefix.
+    conn.execute(
+        "INSERT INTO commands(source, external_id, ts, command) VALUES (?, ?, ?, ?)",
+        ("atuin", "abcd1111", 1, "ls"),
+    )
+    conn.execute(
+        "INSERT INTO commands(source, external_id, ts, command) VALUES (?, ?, ?, ?)",
+        ("atuin", "abcd2222", 1, "pwd"),
+    )
+    refs = [{"source": "atuin", "external_id": "abcd"}]   # ambiguous
+    resolved, total = recommend.resolve_evidence_refs(conn, refs)
+    assert (resolved, total) == (0, 1)
+
+
+def test_frontmatter_includes_evidence_refs_when_present(tmp_path: Path):
+    conn = store.init(tmp_path / "u.sqlite")
+    rec = recommend.Recommendation(
+        title="x",
+        body_markdown="b",
+        signature="sig",
+        evidence_refs=[
+            {"source": "atuin", "external_id": "abc12345"},
+        ],
+    )
+    result = recommend.write(conn, rec, recs_dir=tmp_path / "recs")
+    text = result.path.read_text()
+    fm = json.loads(text.split("```\n", 2)[0].removeprefix("```json\n"))
+    assert fm.get("evidence_refs") == [
+        {"source": "atuin", "external_id": "abc12345"}
+    ]
+
+
+def test_frontmatter_omits_evidence_refs_when_absent(tmp_path: Path):
+    conn = store.init(tmp_path / "u.sqlite")
+    rec = recommend.Recommendation(
+        title="x", body_markdown="b", signature="sig"
+    )
+    result = recommend.write(conn, rec, recs_dir=tmp_path / "recs")
+    text = result.path.read_text()
+    fm = json.loads(text.split("```\n", 2)[0].removeprefix("```json\n"))
+    assert "evidence_refs" not in fm
+
+
 def test_list_returns_all_by_default(tmp_path: Path):
     conn = store.init(tmp_path / "u.sqlite")
     _seed(conn, tmp_path / "recs")

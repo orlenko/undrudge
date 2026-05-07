@@ -175,9 +175,9 @@ def test_digest_shows_author_breakdown_in_repeated_commands(seeded_db: sqlite3.C
 
 def test_digest_uses_author_label_in_session_shell_sample(seeded_db: sqlite3.Connection):
     md = digest.render_daily(seeded_db, end_ts_ms=1_000_001_000_000, window_hours=24 * 365)
-    # Per-session shell samples are tagged with [you] / [agent].
-    assert "[you]" in md
-    assert "[agent]" in md
+    # Per-session shell samples render as `[shell #<handle> <author>]`.
+    assert "[shell" in md and " you]" in md
+    assert " agent]" in md
 
 
 def test_digest_finds_tool_ngrams(seeded_db: sqlite3.Connection):

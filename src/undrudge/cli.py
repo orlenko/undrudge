@@ -170,6 +170,39 @@ def _cmd_implement(args: argparse.Namespace) -> int:
     return _cmd_set_status(args, new_status="implemented")
 
 
+def _cmd_show(args: argparse.Namespace) -> int:
+    """Print the absolute path of the rec's markdown file. Cmd+click in
+    iTerm2 (or pipe to your viewer of choice) takes it from there."""
+    cfg = config.load()
+    conn = store.open_db(cfg.paths.db)
+    try:
+        store.apply_schema(conn)
+        matches = recommend.find_by_id_prefix(conn, args.id)
+    finally:
+        conn.close()
+
+    if not matches:
+        print(f"no recommendation matched id prefix {args.id!r}", file=sys.stderr)
+        return 1
+    if len(matches) > 1:
+        prefixes = [m["id"][:12] for m in matches]
+        print(
+            f"id prefix {args.id!r} is ambiguous "
+            f"({len(matches)} matches: {prefixes})",
+            file=sys.stderr,
+        )
+        return 1
+    body_path = matches[0].get("body_path")
+    if not body_path:
+        print(
+            f"recommendation {matches[0]['id'][:12]} has no body_path on disk",
+            file=sys.stderr,
+        )
+        return 1
+    print(body_path)
+    return 0
+
+
 def _cmd_set_status(args: argparse.Namespace, *, new_status: str) -> int:
     cfg = config.load()
     conn = store.open_db(cfg.paths.db)
@@ -230,6 +263,12 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
     print(f"written:        {len(result.written)}")
     if not args.dry_run:
         print(f"skipped (dup):  {result.skipped}")
+    if result.refs_total:
+        pct = 100 * result.refs_resolved // result.refs_total
+        print(
+            f"evidence refs:  {result.refs_resolved}/{result.refs_total} "
+            f"resolved ({pct}%)"
+        )
     for w in result.written:
         print(f"  - {w.path}")
     return 0
@@ -385,6 +424,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_implement = sub.add_parser("implement", help="Mark a recommendation implemented.")
     p_implement.add_argument("id", help="Full id or unique prefix.")
     p_implement.set_defaults(func=_cmd_implement)
+
+    p_show = sub.add_parser(
+        "show",
+        help="Print the absolute path of a rec's markdown file.",
+    )
+    p_show.add_argument("id", help="Full id or unique prefix.")
+    p_show.set_defaults(func=_cmd_show)
 
     return p
 

@@ -107,6 +107,31 @@ def test_to_recommendations_normalizes_invalid_enums():
     assert rec.confidence == "medium"
 
 
+def test_to_recommendations_captures_well_shaped_evidence_refs():
+    items = [{
+        "title": "x",
+        "signature": "y",
+        "evidence_refs": [
+            {"source": "atuin", "external_id": "abc12345", "note": "first hit"},
+            {"source": "claude", "external_id": "def67890"},
+            {"source": "atuin"},                       # missing external_id → drop
+            {"external_id": "lonely"},                 # missing source → drop
+            "not a dict",                              # not a dict → drop
+        ],
+    }]
+    recs = analyze.to_recommendations(items, scope="daily")
+    assert recs[0].evidence_refs is not None
+    assert len(recs[0].evidence_refs) == 2
+    sources = {r["source"] for r in recs[0].evidence_refs}
+    assert sources == {"atuin", "claude"}
+
+
+def test_to_recommendations_evidence_refs_none_when_empty():
+    items = [{"title": "x", "signature": "y", "evidence_refs": []}]
+    recs = analyze.to_recommendations(items, scope="daily")
+    assert recs[0].evidence_refs is None
+
+
 # --------------------------------------------------------------------------
 # Recommendation fingerprint
 # --------------------------------------------------------------------------

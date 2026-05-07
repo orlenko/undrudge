@@ -24,6 +24,7 @@ import json
 import re
 import sqlite3
 from collections import Counter, defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -32,6 +33,7 @@ from . import store
 
 DEFAULT_WINDOW_HOURS = 24
 SESSION_ID_PREFIX = 8         # short id width in the heading
+HANDLE_PREFIX = 8             # short id width for [shell #...] / [msg #...] refs
 TOP_TOOLS = 5
 PROMPT_HEAD_CHARS = 280
 MAX_SESSIONS_LISTED = 25
@@ -40,6 +42,7 @@ MAX_REPEATED_PROMPTS = 25
 MAX_REPEATED_COMMANDS = 30
 MAX_TOOL_NGRAMS = 20
 MAX_ERROR_CHAINS = 15
+MAX_HANDLES_PER_CLUSTER = 3   # stable refs to surface for repeat clusters
 NGRAM_WINDOW = 3
 
 
@@ -194,7 +197,7 @@ def _render_sessions(conn: sqlite3.Connection, start: int, end: int) -> str:
         # Shell commands run during this session's time range, attributed
         # by overlap. Best-effort temporal correlation, no fancy joins.
         cmd_rows = conn.execute(
-            """SELECT command, author FROM commands
+            """SELECT external_id, command, author FROM commands
                 WHERE ts BETWEEN ? AND ?
                 ORDER BY ts ASC LIMIT 5""",
             (r["first_ts"], r["last_ts"]),
@@ -203,25 +206,33 @@ def _render_sessions(conn: sqlite3.Connection, start: int, end: int) -> str:
             out.append("- shell during session (sample):")
             for c in cmd_rows:
                 tag = _author_label(c["author"])
-                out.append(f"  - [{tag}] `{_one_line(c['command'])[:140]}`")
+                handle = (
+                    f" #{_short_handle(c['external_id'])}"
+                    if c["external_id"]
+                    else ""
+                )
+                out.append(
+                    f"  - [shell{handle} {tag}] `{_one_line(c['command'])[:140]}`"
+                )
 
     return "\n".join(out) + "\n"
 
 
 def _render_repeated_prompts(conn: sqlite3.Connection, start: int, end: int) -> str:
     rows = conn.execute(
-        """SELECT session_id, text FROM messages
+        """SELECT id AS msg_id, session_id, text FROM messages
              WHERE role = 'user' AND ts BETWEEN ? AND ?
                AND text IS NOT NULL AND text != ''""",
         (start, end),
     ).fetchall()
 
-    buckets: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    # (msg_id, session_id, text) per skeleton
+    buckets: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
     for r in rows:
         skeleton = canonicalize_prompt(r["text"])
         if not skeleton or len(skeleton) < 12:
             continue
-        buckets[skeleton].append((r["session_id"], r["text"]))
+        buckets[skeleton].append((r["msg_id"], r["session_id"], r["text"]))
 
     repeats = sorted(
         ((sk, items) for sk, items in buckets.items() if len(items) >= MIN_REPEAT_COUNT),
@@ -233,10 +244,11 @@ def _render_repeated_prompts(conn: sqlite3.Connection, start: int, end: int) -> 
 
     out = ["## Repeated user-prompt skeletons"]
     for skeleton, items in repeats:
-        sessions = sorted({sid for sid, _ in items})
-        sample = items[0][1]
+        sessions = sorted({sid for _, sid, _ in items})
+        sample = items[0][2]
+        handles = _format_handles("msg", (mid for mid, _, _ in items))
         out.append(
-            f"- ×{len(items)} across {len(sessions)} session(s): "
+            f"- ×{len(items)} across {len(sessions)} session(s){handles}: "
             f"`{_one_line(skeleton)[:160]}`"
         )
         out.append(f"  - sample: {_quote_one_line(sample)}")
@@ -245,13 +257,14 @@ def _render_repeated_prompts(conn: sqlite3.Connection, start: int, end: int) -> 
 
 def _render_repeated_commands(conn: sqlite3.Connection, start: int, end: int) -> str:
     rows = conn.execute(
-        "SELECT command, author FROM commands WHERE ts BETWEEN ? AND ?",
+        "SELECT external_id, command, author FROM commands WHERE ts BETWEEN ? AND ?",
         (start, end),
     ).fetchall()
 
     counter: Counter[str] = Counter()
     by_author: dict[str, Counter[str]] = defaultdict(Counter)
     sample: dict[str, str] = {}
+    handles: dict[str, list[str]] = defaultdict(list)
     for r in rows:
         cmd = r["command"]
         if not cmd:
@@ -262,6 +275,8 @@ def _render_repeated_commands(conn: sqlite3.Connection, start: int, end: int) ->
         counter[skel] += 1
         by_author[skel][_author_label(r["author"])] += 1
         sample.setdefault(skel, cmd)
+        if r["external_id"]:
+            handles[skel].append(r["external_id"])
 
     repeats = [
         (skel, count) for skel, count in counter.most_common(MAX_REPEATED_COMMANDS)
@@ -273,7 +288,8 @@ def _render_repeated_commands(conn: sqlite3.Connection, start: int, end: int) ->
     out = ["## Repeated shell commands"]
     for skel, count in repeats:
         breakdown = _format_author_breakdown(by_author[skel])
-        out.append(f"- ×{count}{breakdown}: `{_one_line(skel)[:200]}`")
+        ref = _format_handles("shell", handles[skel])
+        out.append(f"- ×{count}{breakdown}{ref}: `{_one_line(skel)[:200]}`")
         if sample[skel] != skel:
             out.append(f"  - sample: `{_one_line(sample[skel])[:200]}`")
     return "\n".join(out) + "\n"
@@ -337,10 +353,11 @@ def _render_tool_ngrams(conn: sqlite3.Connection, start: int, end: int) -> str:
 
 def _render_error_chains(conn: sqlite3.Connection, start: int, end: int) -> str:
     rows = conn.execute(
-        """SELECT m.session_id AS sid,
-                  m.seq        AS seq,
-                  m.tool_name  AS name,
-                  m.tool_input AS args,
+        """SELECT m.id          AS msg_id,
+                  m.session_id  AS sid,
+                  m.seq         AS seq,
+                  m.tool_name   AS name,
+                  m.tool_input  AS args,
                   m.tool_result AS result
              FROM messages m
             WHERE m.is_error = 1 AND m.ts BETWEEN ? AND ?
@@ -364,7 +381,14 @@ def _render_error_chains(conn: sqlite3.Connection, start: int, end: int) -> str:
             args = _short_json(it["args"])
             result = _one_line(it["result"] or "")[:140]
             tool = it["name"] or "(tool_result)"
-            out.append(f"- {short}@seq{it['seq']}: {tool} {args} → {result}")
+            handle = (
+                f" [msg #{_short_handle(it['msg_id'])}]"
+                if it["msg_id"]
+                else ""
+            )
+            out.append(
+                f"- {short}@seq{it['seq']}{handle}: {tool} {args} → {result}"
+            )
             shown += 1
             if shown >= MAX_ERROR_CHAINS:
                 break
@@ -442,6 +466,31 @@ def canonicalize_command(cmd: str) -> str:
 def _short_session_id(sid: str, *, width: int = SESSION_ID_PREFIX) -> str:
     """Stable short id that works for UUIDs and arbitrary string ids alike."""
     return sid.replace("-", "")[:width]
+
+
+def _short_handle(raw: str | None, *, width: int = HANDLE_PREFIX) -> str:
+    """8-char prefix used for [shell #...] / [msg #...] refs in the digest.
+
+    Strips dashes (to keep UUIDs and atuin ids the same shape) and clips
+    to ``width``. The same form is what the LLM cites in evidence_refs;
+    the resolver does a prefix match against the full id.
+    """
+    if not raw:
+        return ""
+    return raw.replace("-", "")[:width]
+
+
+def _format_handles(kind: str, ids: Iterable[str]) -> str:
+    """Render `[<kind> #abc12345 def67890]` from up to N stable ids."""
+    seen: list[str] = []
+    for raw in ids:
+        h = _short_handle(raw)
+        if not h or h in seen:
+            continue
+        seen.append(h)
+        if len(seen) >= MAX_HANDLES_PER_CLUSTER:
+            break
+    return f" [{kind} #{' '.join(seen)}]" if seen else ""
 
 
 def _fmt_ts(ms: int) -> str:

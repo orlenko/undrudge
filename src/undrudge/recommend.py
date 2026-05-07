@@ -41,6 +41,12 @@ class Recommendation:
     confidence: str = "medium"
     rationale: str = ""
     evidence: list[Any] | None = None
+    # Probe-phase: structured citations from the LLM. Each item is a dict
+    # with `source` ("atuin" / "claude"), `external_id` (8+ char prefix
+    # of the row id from the digest), and optional `note`. Validated
+    # at write time; unresolved refs are kept as-is and counted for
+    # tuning the digest format.
+    evidence_refs: list[dict[str, Any]] | None = None
     scope: str = "daily"
 
     def fingerprint(self) -> str:
@@ -152,6 +158,8 @@ def _frontmatter(rec: Recommendation, *, fingerprint: str, created: datetime) ->
         "signature": rec.signature,
         "evidence": rec.evidence or [],
     }
+    if rec.evidence_refs:
+        payload["evidence_refs"] = rec.evidence_refs
     if rec.rationale:
         payload["rationale"] = rec.rationale
     body = json.dumps(payload, indent=2, default=str, ensure_ascii=False)
@@ -182,6 +190,7 @@ def normalize(rec: Recommendation) -> Recommendation:
         confidence=confidence,
         rationale=rec.rationale.strip(),
         evidence=rec.evidence or [],
+        evidence_refs=rec.evidence_refs,
         scope=rec.scope,
     )
 
@@ -295,6 +304,59 @@ def render_recent_for_prompt(rows: Iterable[dict[str, Any]]) -> str:
     for r in rows:
         lines.append(f"- [{r['status']}] {r['title']} — `{r['signature']}`")
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Evidence-ref resolution (probe phase)
+# --------------------------------------------------------------------------
+
+
+def resolve_evidence_refs(
+    conn: sqlite3.Connection, refs: list[dict[str, Any]] | None
+) -> tuple[int, int]:
+    """Count how many of an LLM-produced ``evidence_refs`` list resolve.
+
+    A ref is resolved if its ``external_id`` is a unique-prefix match
+    against ``commands.external_id`` (for ``source == 'atuin'`` /
+    ``'shell'``) or ``messages.id`` (for ``source == 'claude'`` /
+    ``'msg'``). Returns ``(resolved, total_well_formed)``. Malformed
+    refs (missing source or id) are excluded from both counts.
+
+    The 8-char handle the digest emits is normalized by stripping
+    dashes; UUIDs in the DB get the same treatment for the comparison.
+    Ambiguous prefixes (>1 hit) count as unresolved — that's a signal
+    the digest needs longer handles.
+    """
+    if not refs:
+        return (0, 0)
+    resolved = 0
+    total = 0
+    for ref in refs:
+        if not isinstance(ref, dict):
+            continue
+        source = (ref.get("source") or "").strip().lower()
+        ext_id_raw = ref.get("external_id") or ""
+        ext_id = str(ext_id_raw).strip().replace("-", "")
+        if not source or not ext_id:
+            continue
+        if source in ("atuin", "shell"):
+            query = (
+                "SELECT 1 FROM commands "
+                "WHERE REPLACE(external_id, '-', '') LIKE ? LIMIT 2"
+            )
+        elif source in ("claude", "msg", "message"):
+            query = (
+                "SELECT 1 FROM messages "
+                "WHERE REPLACE(id, '-', '') LIKE ? LIMIT 2"
+            )
+        else:
+            # Unknown source — can't resolve, don't count toward total either.
+            continue
+        total += 1
+        hits = conn.execute(query, (ext_id + "%",)).fetchall()
+        if len(hits) == 1:
+            resolved += 1
+    return (resolved, total)
 
 
 # --------------------------------------------------------------------------

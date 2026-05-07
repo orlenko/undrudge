@@ -42,6 +42,10 @@ class AnalyzeResult:
     parsed: list[recommend.Recommendation]
     written: list[recommend.WriteResult]
     skipped: int
+    # Probe-phase: how many evidence_refs the LLM produced and how many
+    # resolved to actual DB rows. Used to tune the digest format.
+    refs_total: int = 0
+    refs_resolved: int = 0
     workdir: Path | None = None
 
 
@@ -241,6 +245,14 @@ def to_recommendations(items: list[dict], *, scope: str) -> list[recommend.Recom
         signature = str(item.get("signature") or "").strip()
         if not title or not signature:
             continue
+        refs = item.get("evidence_refs") or []
+        # Keep only well-shaped dicts; the resolver tolerates more, but
+        # the on-disk frontmatter shouldn't include junk like strings or
+        # dicts missing the two required fields.
+        clean_refs = [
+            r for r in refs
+            if isinstance(r, dict) and r.get("source") and r.get("external_id")
+        ]
         out.append(
             recommend.Recommendation(
                 title=title,
@@ -250,6 +262,7 @@ def to_recommendations(items: list[dict], *, scope: str) -> list[recommend.Recom
                 confidence=str(item.get("confidence") or "medium"),
                 rationale=str(item.get("rationale") or ""),
                 evidence=item.get("evidence") or [],
+                evidence_refs=clean_refs or None,
                 scope=scope,
             )
         )
@@ -323,6 +336,12 @@ def run(
     items = extract_json_array(response)
     recs = to_recommendations(items, scope=scope)
 
+    refs_resolved, refs_total = 0, 0
+    for rec in recs:
+        r, t = recommend.resolve_evidence_refs(conn, rec.evidence_refs)
+        refs_resolved += r
+        refs_total += t
+
     if dry_run:
         written: list[recommend.WriteResult] = []
         for rec in recs:
@@ -341,7 +360,10 @@ def run(
                 inserted=False, skipped_reason="dry-run",
             ))
         return AnalyzeResult(prompt=prompt, response=response, parsed=recs,
-                             written=written, skipped=0, workdir=workdir)
+                             written=written, skipped=0,
+                             refs_total=refs_total,
+                             refs_resolved=refs_resolved,
+                             workdir=workdir)
 
     written = []
     skipped = 0
@@ -355,4 +377,7 @@ def run(
         else:
             skipped += 1
     return AnalyzeResult(prompt=prompt, response=response, parsed=recs,
-                         written=written, skipped=skipped, workdir=workdir)
+                         written=written, skipped=skipped,
+                         refs_total=refs_total,
+                         refs_resolved=refs_resolved,
+                         workdir=workdir)
