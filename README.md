@@ -57,7 +57,7 @@ Three subcommands, one binary, no daemon.
             │               │             │
      hourly │        daily  │      weekly │ (or ad-hoc)
             ▼               ▼             ▼
-       gather          analyze        analyze --meta
+       gather          analyze day    analyze week
             │               │             │
             ▼               ▼             ▼
     ingest+sanitize    digest + claude -p + dedupe
@@ -203,7 +203,7 @@ TAIL_N=200 ./scripts/dev-test.sh   # more output
 ./scripts/dev-fresh.sh             # wipe scratch dirs, init a clean sandbox
 ./scripts/dev-fresh.sh doctor      # ...then run doctor in that sandbox
 ./scripts/dev-fresh.sh gather
-./scripts/dev-fresh.sh analyze --dry-run --window 24h
+./scripts/dev-fresh.sh analyze --dry-run day
 ```
 
 Both scripts started life as recommendations undrudge made about its
