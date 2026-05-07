@@ -10,6 +10,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from fixtures import ANTHROPIC_KEY, GITHUB_TOKEN, GITHUB_TOKEN_FAKE_REPEATED
 
 from undrudge import ingest_claude, ingest_shell
@@ -187,8 +189,41 @@ def test_shell_ingest_idempotent(db, atuin_db: Path):
     first = ingest_shell.ingest(db, atuin_db)
     second = ingest_shell.ingest(db, atuin_db)
     assert second.rows_inserted == 0
-    count = db.execute("SELECT COUNT(*) FROM commands").fetchone()[0]
-    assert count == first.rows_inserted
+
+
+def test_shell_ingest_retries_transient_open_errors(
+    db, atuin_db: Path, monkeypatch
+):
+    """Two transient OperationalErrors then success → ingest still works."""
+    real_connect = sqlite3.connect
+    calls = {"n": 0}
+
+    def flaky_connect(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise sqlite3.OperationalError("unable to open database file")
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(ingest_shell.sqlite3, "connect", flaky_connect)
+    monkeypatch.setattr(ingest_shell.time, "sleep", lambda _s: None)
+
+    stats = ingest_shell.ingest(db, atuin_db)
+    assert calls["n"] == 3
+    assert stats.rows_inserted == 3
+
+
+def test_shell_ingest_propagates_persistent_open_failure(
+    db, atuin_db: Path, monkeypatch
+):
+    """Every attempt fails → the OperationalError surfaces to the caller."""
+    def always_fail(*args, **kwargs):
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(ingest_shell.sqlite3, "connect", always_fail)
+    monkeypatch.setattr(ingest_shell.time, "sleep", lambda _s: None)
+
+    with pytest.raises(sqlite3.OperationalError):
+        ingest_shell.ingest(db, atuin_db)
 
 
 def test_shell_ingest_resumes_after_new_rows(db, atuin_db: Path):

@@ -13,12 +13,21 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import sanitize, store
 
 ATUIN_SOURCE = "atuin"
+
+# Atuin's daemon holds history.db and uses WAL; sporadic
+# `OperationalError: unable to open database file` shows up around
+# checkpoints and macOS DarkWake transitions when launchd fires gather
+# during a not-fully-awake window. Retry-with-backoff swallows both.
+_OPEN_ATTEMPTS = 3
+_OPEN_BACKOFF_SECONDS = 1.0
 
 
 @dataclass
@@ -66,29 +75,7 @@ def ingest(
     cursor_ns = _read_cursor(conn)
     stats.last_ts_ns = cursor_ns
 
-    uri = f"file:{atuin_db_path}?mode=ro"
-    src = sqlite3.connect(uri, uri=True)
-    src.row_factory = sqlite3.Row
-
-    try:
-        cols = {row[1] for row in src.execute("PRAGMA table_info(history)")}
-        select_cols = (
-            "id, timestamp, duration, exit, command, cwd, session, hostname"
-        )
-        if "author" in cols:
-            select_cols += ", author"
-        if "intent" in cols:
-            select_cols += ", intent"
-        rows = src.execute(
-            f"""SELECT {select_cols}
-                 FROM history
-                WHERE deleted_at IS NULL
-                  AND timestamp > ?
-                ORDER BY timestamp ASC""",
-            (cursor_ns,),
-        ).fetchall()
-    finally:
-        src.close()
+    rows = _read_atuin_rows_with_retry(atuin_db_path, cursor_ns)
 
     max_ts_ns = cursor_ns
     for row in rows:
@@ -152,3 +139,51 @@ def ingest(
         stats.last_ts_ns = max_ts_ns
 
     return stats
+
+
+def _read_atuin_rows_with_retry(
+    atuin_db_path: Path, cursor_ns: int
+) -> list[sqlite3.Row]:
+    """Open atuin's history.db read-only and pull rows newer than cursor_ns.
+
+    Retries a small number of times on ``OperationalError`` so transient
+    "unable to open database file" failures (atuin daemon mid-checkpoint,
+    DarkWake fs hand-off) don't surface as a noisy gather traceback.
+    """
+    last_exc: sqlite3.OperationalError | None = None
+    for attempt in range(_OPEN_ATTEMPTS):
+        try:
+            uri = f"file:{atuin_db_path}?mode=ro"
+            src = sqlite3.connect(uri, uri=True)
+            src.row_factory = sqlite3.Row
+            try:
+                cols = {row[1] for row in src.execute("PRAGMA table_info(history)")}
+                select_cols = (
+                    "id, timestamp, duration, exit, command, cwd, session, hostname"
+                )
+                if "author" in cols:
+                    select_cols += ", author"
+                if "intent" in cols:
+                    select_cols += ", intent"
+                return src.execute(
+                    f"""SELECT {select_cols}
+                         FROM history
+                        WHERE deleted_at IS NULL
+                          AND timestamp > ?
+                        ORDER BY timestamp ASC""",
+                    (cursor_ns,),
+                ).fetchall()
+            finally:
+                src.close()
+        except sqlite3.OperationalError as e:
+            last_exc = e
+            if attempt < _OPEN_ATTEMPTS - 1:
+                delay = _OPEN_BACKOFF_SECONDS * (2 ** attempt)
+                print(
+                    f"undrudge: atuin open failed ({e}); "
+                    f"retry {attempt + 1}/{_OPEN_ATTEMPTS - 1} in {delay:.0f}s",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
