@@ -38,7 +38,7 @@ touch -a "$HOME/.claude.lock"
 exec nono run \
   --allow-cwd \
   --allow "$HOME/.claude" \
-  --allow "$HOME/.claude.lock" \
+  --allow-file "$HOME/.claude.lock" \
   --allow "$HOME/.local/share/claude" \
   --allow "$HOME/.local/state/claude" \
   --allow "$HOME/.local/share/undrudge" \
