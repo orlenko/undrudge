@@ -194,6 +194,10 @@ def _cmd_set_status(args: argparse.Namespace, *, new_status: str) -> int:
 
 
 def _cmd_analyze(args: argparse.Namespace) -> int:
+    # Resolve preset -> defaults. Explicit --window / --meta override.
+    meta = args.meta or (args.preset == "week")
+    window = args.window or ("7d" if args.preset == "week" else "24h")
+
     cfg = config.load()
     conn = store.open_db(cfg.paths.db)
     try:
@@ -201,7 +205,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
 
         if args.prompt_only:
             digest_md = digest.render_daily(
-                conn, window_hours=_parse_window(args.window)
+                conn, window_hours=_parse_window(window)
             )
             recent = recommend.recent_logged(conn)
             recent_md = recommend.render_recent_for_prompt(recent)
@@ -211,8 +215,8 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         result = analyze.run(
             conn,
             cfg,
-            window_hours=_parse_window(args.window),
-            scope="weekly" if args.meta else "daily",
+            window_hours=_parse_window(window),
+            scope="weekly" if meta else "daily",
             dry_run=args.dry_run,
         )
     finally:
@@ -347,10 +351,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "analyze",
         help="Render digest, call claude -p, write recommendations.",
     )
+    p_analyze.add_argument(
+        "preset", nargs="?", choices=["day", "week"], default=None,
+        help="Convenience preset. 'day' = 24h trailing, regular daily run. "
+             "'week' = 7d trailing, --meta. Explicit flags override.",
+    )
     p_analyze.add_argument("--meta", action="store_true",
                            help="Weekly meta-analysis (scope=weekly).")
-    p_analyze.add_argument("--window", default="24h",
-                           help="Trailing window: e.g. 24h, 7d. Default 24h.")
+    p_analyze.add_argument("--window", default=None,
+                           help="Trailing window: e.g. 24h, 7d. Default: 24h "
+                                "(or 7d when preset=week).")
     p_analyze.add_argument("--dry-run", action="store_true",
                            help="Call the LLM but write to dry-run/ instead of recs_dir; "
                                 "skip DB rows and the on_write hook.")

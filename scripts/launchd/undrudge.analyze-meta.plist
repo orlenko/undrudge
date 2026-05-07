@@ -9,9 +9,7 @@
     <array>
         <string>__HOME__/.local/bin/undrudge</string>
         <string>analyze</string>
-        <string>--meta</string>
-        <string>--window</string>
-        <string>7d</string>
+        <string>week</string>
     </array>
 
     <!-- Sundays at 03:00 (Weekday=0 is Sunday in launchd). -->

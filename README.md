@@ -71,20 +71,31 @@ Three subcommands, one binary, no daemon.
 
 ```bash
 undrudge gather              # ingest new Claude + shell activity (hourly)
-undrudge digest --window 24h --out -      # render a digest (no LLM call)
-undrudge analyze --dry-run --window 24h   # call claude, write recs to dry-run dir
-undrudge analyze --window 24h             # real run
+undrudge analyze day         # daily digest → recs (24h trailing, regular)
+undrudge analyze week        # weekly meta digest → recs (7d trailing, --meta)
+undrudge analyze --dry-run day    # daily run, but write to dry-run/ (skip DB+hook)
+undrudge digest --window 24h --out -   # render a digest only (no LLM call)
 undrudge list                # show recommendations
 undrudge dismiss <id>        # mark a rec dismissed (full id or any unique prefix)
 undrudge implement <id>      # mark a rec implemented
 ```
 
-A typical cron setup:
+`day` and `week` are convenience presets — they set `--window`/`--meta`
+to the values the schedulers use. Either flag can override the preset
+(e.g. `undrudge analyze week --window 14d`). Use `analyze` with no
+preset to keep the previous default (24h regular).
+
+If a scheduled run misses (laptop asleep, Claude API blip, you closed
+the lid), running these by hand replays them. Recs are deduplicated by
+fingerprint, so re-running is safe — duplicates just count as
+`skipped (dup)` in the output.
+
+A typical scheduler setup:
 
 ```
 17 *  * * *   ~/.local/bin/undrudge gather
-30 2  * * *   ~/.local/bin/undrudge analyze
-0  3  * * 0   ~/.local/bin/undrudge analyze --meta --window 7d
+30 2  * * *   ~/.local/bin/undrudge analyze day
+0  3  * * 0   ~/.local/bin/undrudge analyze week
 ```
 
 ### macOS: prefer launchd, or grant cron Full Disk Access

@@ -9,6 +9,7 @@
     <array>
         <string>__HOME__/.local/bin/undrudge</string>
         <string>analyze</string>
+        <string>day</string>
     </array>
 
     <!-- Daily at 02:30. -->
