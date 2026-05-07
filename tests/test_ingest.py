@@ -11,7 +11,6 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-
 from fixtures import ANTHROPIC_KEY, GITHUB_TOKEN, GITHUB_TOKEN_FAKE_REPEATED
 
 from undrudge import ingest_claude, ingest_shell
