@@ -28,21 +28,23 @@ fi
 COLS="$(tput cols 2>/dev/null || echo 80)"
 ROWS="$(tput lines 2>/dev/null || echo 24)"
 
-# nono drops --allow grants for paths that don't exist at sandbox-init.
-# claude-code's inter-process lock at $HOME/.claude.lock won't exist on
-# a fresh machine, so the grant gets silently skipped, and then claude
-# blocks for our 900s timeout trying to create it. Touch first to make
-# the grant stick. -a leaves mtime alone so we don't churn the lock.
+# nono drops grants for paths that don't exist at sandbox-init time;
+# the `claude` profile grants $HOME/.claude.lock, but if the file is
+# missing on a fresh machine the grant is silently skipped and claude
+# then blocks for the 900s timeout trying to create it. Touching with
+# -a creates an empty lock without churning mtime if it already exists.
 touch -a "$HOME/.claude.lock"
 
+# Profile is shipped as the `always-further/claude` pack on nono ≥ 0.48
+# (built-in `claude-code` was removed in 0.48). Install once with:
+#     nono pull always-further/claude
 exec nono run \
   --allow-cwd \
   --allow "$HOME/.claude" \
-  --allow-file "$HOME/.claude.lock" \
   --allow "$HOME/.local/share/claude" \
   --allow "$HOME/.local/state/claude" \
   --allow "$HOME/.local/share/undrudge" \
   --read-file "$HOME/.gitconfig" \
   --read "$HOME/.config/configstore" \
-  --profile claude-code \
+  --profile claude \
   -- env "COLUMNS=$COLS" "LINES=$ROWS" claude --dangerously-skip-permissions "$@"
