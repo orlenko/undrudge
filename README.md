@@ -1,6 +1,7 @@
 # undrudge
 
-<img width="1448" height="1086" alt="image" src="https://github.com/user-attachments/assets/c4ec31ab-4479-4eb9-ac09-36f255f9e0f7" />
+<img width="1448" height="1086" alt="rozmarujennya" src="https://github.com/user-attachments/assets/57259488-e837-4ae9-96f9-fe5aff6fb96f" />
+
 
 A background watchman that watches what you do in Claude Code and your
 shell, finds the parts that look like muscle memory, and writes
