@@ -28,6 +28,13 @@ fi
 COLS="$(tput cols 2>/dev/null || echo 80)"
 ROWS="$(tput lines 2>/dev/null || echo 24)"
 
+# nono drops --allow grants for paths that don't exist at sandbox-init.
+# claude-code's inter-process lock at $HOME/.claude.lock won't exist on
+# a fresh machine, so the grant gets silently skipped, and then claude
+# blocks for our 900s timeout trying to create it. Touch first to make
+# the grant stick. -a leaves mtime alone so we don't churn the lock.
+touch -a "$HOME/.claude.lock"
+
 exec nono run \
   --allow-cwd \
   --allow "$HOME/.claude" \
