@@ -46,6 +46,7 @@ MAX_REPEATED_COMMANDS = 30
 MAX_TOOL_NGRAMS = 20
 MAX_ERROR_CHAINS = 15
 MAX_HANDLES_PER_CLUSTER = 3   # stable refs to surface for repeat clusters
+MAX_PRS_LISTED = 5            # PR numbers shown inline before truncating
 NGRAM_WINDOW = 3
 
 
@@ -264,9 +265,13 @@ def _render_repeated_prompts(conn: sqlite3.Connection, start: int, end: int) -> 
         sample = items[0][2]
         handles = _format_handles("msg", (mid for mid, _, _, _ in items))
         projects = _format_project_summary(p for _, _, _, p in items)
+        prs: set[int] = set()
+        for _, _, text, _ in items:
+            prs |= _extract_pr_numbers(text)
+        pr_summary = _format_pr_summary(prs)
         out.append(
             f"- ×{len(items)} across {len(sessions)} session(s)"
-            f"{projects}{handles}: `{_one_line(skeleton)[:160]}`"
+            f"{projects}{pr_summary}{handles}: `{_one_line(skeleton)[:160]}`"
         )
         out.append(f"  - sample: {_quote_one_line(sample)}")
     return "\n".join(out) + "\n"
@@ -288,6 +293,7 @@ def _render_repeated_commands(
     sample: dict[str, str] = {}
     handles: dict[str, list[str]] = defaultdict(list)
     cwd_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    pr_nums: dict[str, set[int]] = defaultdict(set)
     for r in rows:
         cmd = r["command"]
         if not cmd:
@@ -302,6 +308,7 @@ def _render_repeated_commands(
             handles[skel].append(r["external_id"])
         if r["cwd"]:
             cwd_counts[skel][r["cwd"]] += 1
+        pr_nums[skel] |= _extract_pr_numbers(cmd)
 
     repeats = [
         (skel, count) for skel, count in counter.most_common(MAX_REPEATED_COMMANDS)
@@ -315,8 +322,9 @@ def _render_repeated_commands(
         breakdown = _format_author_breakdown(by_author[skel])
         ref = _format_handles("shell", handles[skel])
         location = _format_cwd_summary(cwd_counts[skel], git_cache)
+        prs = _format_pr_summary(pr_nums[skel])
         out.append(
-            f"- ×{count}{breakdown}{location}{ref}: "
+            f"- ×{count}{breakdown}{location}{prs}{ref}: "
             f"`{_one_line(skel)[:200]}`"
         )
         if sample[skel] != skel:
@@ -427,6 +435,48 @@ def _render_error_chains(conn: sqlite3.Connection, start: int, end: int) -> str:
 # --------------------------------------------------------------------------
 # Canonicalization
 # --------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------
+# PR-number extraction
+# --------------------------------------------------------------------------
+
+# Heuristic: catches the `gh pr <verb>` family, github URL/API forms
+# (`pull/<n>`, `pulls/<n>`), and natural-language references in user
+# prompts ("look at PR 350", "pull request #351"). Whitelisted verbs
+# only — `gh pr list --limit 100` would otherwise match the limit
+# value as a PR number. Heuristic, not authoritative; a wrong
+# extraction is acceptable here because the command/prompt text
+# itself stays in the digest for the LLM to disambiguate.
+_PR_VERBS = [
+    "view", "checkout", "merge", "review", "close", "reopen",
+    "comment", "edit", "lock", "unlock", "ready", "diff",
+]
+_PR_PATTERNS = [
+    re.compile(
+        r"\bgh\s+pr\s+(?:" + "|".join(_PR_VERBS) + r")\b[^\n]{0,120}?\b(\d+)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bpulls?/(\d+)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:PR|pull[\s\-]?request)\s*#?\s*(\d+)\b",
+        re.IGNORECASE,
+    ),
+]
+
+
+def _extract_pr_numbers(text: str | None) -> set[int]:
+    """Return the set of likely-PR numbers cited in ``text``."""
+    if not text:
+        return set()
+    out: set[int] = set()
+    for pat in _PR_PATTERNS:
+        for m in pat.finditer(text):
+            try:
+                out.add(int(m.group(1)))
+            except (ValueError, TypeError):
+                continue
+    return out
 
 
 _RE_PATH = re.compile(
@@ -615,6 +665,19 @@ def _format_cwd_summary(
     rest = sum(n for _, n in items[MAX_HANDLES_PER_CLUSTER:])
     suffix = f" +{rest} in {len(items) - MAX_HANDLES_PER_CLUSTER} more" if rest else ""
     return f" across {len(items)} dirs ({rendered}{suffix})"
+
+
+def _format_pr_summary(pr_nums: set[int]) -> str:
+    """Cluster-level GitHub PR annotation when ``_extract_pr_numbers``
+    found anything in the cluster's commands or prompts."""
+    if not pr_nums:
+        return ""
+    sorted_prs = sorted(pr_nums)
+    head = sorted_prs[: MAX_PRS_LISTED]
+    rendered = ", ".join(f"#{n}" for n in head)
+    rest = len(sorted_prs) - len(head)
+    suffix = f" +{rest} more" if rest else ""
+    return f" PRs: {rendered}{suffix}"
 
 
 def _format_project_summary(projects: Iterable[str | None]) -> str:

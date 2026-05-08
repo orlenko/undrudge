@@ -159,6 +159,33 @@ def test_digest_finds_repeated_user_prompts(seeded_db: sqlite3.Connection):
     section = md.split("## Repeated user-prompt skeletons", 1)[1].split("##", 1)[0]
     assert "across 2 projects" in section
     assert "foo" in section and "bar" in section
+    # PRs cited in the prompts (100, 200, 300) should be aggregated.
+    assert "PRs:" in section
+    for pr in ("#100", "#200", "#300"):
+        assert pr in section
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("gh pr view 350", {350}),
+        ("gh pr checkout 351 -R foo/bar", {351}),
+        ("gh pr merge --squash 352", {352}),
+        ("gh api repos/foo/bar/pulls/353/comments", {353}),
+        ("git fetch origin pull/354/head:pr-354", {354}),
+        ("https://github.com/foo/bar/pull/355", {355}),
+        ("look at PR 100", {100}),
+        ("analyze pull request #200", {200}),
+        ("we need pull-request 201 reviewed", {201}),
+        # Negative: list/status verbs and bare numbers should not match.
+        ("gh pr list --limit 100", set()),
+        ("gh pr status", set()),
+        ("ls -la /repo/100", set()),
+        ("", set()),
+    ],
+)
+def test_extract_pr_numbers(text: str, expected: set[int]):
+    assert digest._extract_pr_numbers(text) == expected
 
 
 def test_digest_finds_repeated_shell_skeleton(seeded_db: sqlite3.Connection):

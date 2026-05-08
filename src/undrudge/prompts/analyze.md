@@ -99,6 +99,31 @@ that was active when the command ran. Treat it as a hint, not a
 guarantee. cwd and repo path are captured at ingest time and are
 authoritative.
 
+# Pull-request context
+
+Repeated-command and repeated-prompt clusters can also carry a
+` PRs: #350, #351 (+2 more)` annotation when GitHub PR numbers are
+extracted from the underlying commands or prompts (e.g. `gh pr view
+350`, `pull/351`, "look at PR 352" in a user prompt). Clusters
+without any extracted PR show no annotation.
+
+Use this signal alongside cwd/repo:
+
+- **Same repo + multiple PRs** = the user/agent cycles the same
+  pattern across PRs in a single project. Strong candidate for a
+  PR-aware helper inside that repo (`scripts/pr-on-branch.sh <pr>`,
+  a `gh` alias, etc.) — the repeated PR lookups are the core of the
+  workflow.
+- **Multiple repos + PRs** = a cross-cutting PR workflow that lives
+  in a shared dotfile or a `gh` alias used everywhere.
+- **One PR, many invocations** = the agent is grinding on a single
+  review; the rec might be "stop redoing this; cache the answer" or
+  "wrap into a single helper command for the duration of the review."
+
+Where a single PR dominates a cluster, mention it by number in the
+rec body so the user can grep their PR backlog. Don't fabricate PR
+numbers — only use what the digest surfaces.
+
 # Output
 
 Your final output must be **only** a JSON array — no prose around it, no
