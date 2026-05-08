@@ -73,6 +73,32 @@ If you can't cite specific rows for a given rec, return `evidence_refs:
 []`. Don't fabricate handles — the harness measures resolution rate
 and uses that signal to tune what we surface in the digest.
 
+# Location context
+
+Repeated-command and repeated-prompt clusters now carry location
+annotations: ` in `repo-name` [branch]` for shell rows where the cwd
+resolves to a git repo, and ` across N dirs (...)` when the same
+pattern hit multiple cwds. Per-session shell samples show their cwd
+inline. Repeated-prompt clusters carry `in `project-name`` when
+pulled from a single Claude project, or `across N projects (...)`
+otherwise.
+
+Use this for two judgment calls:
+
+- **Single location** = strong signal for a *localized* fix. Suggest
+  the script live inside that repo's `scripts/` (or wherever it
+  conventionally goes), and reference the repo name in the rec body
+  so the user / next agent knows where to put it.
+- **Multiple locations** = the pattern is cross-cutting. Suggest a
+  shared helper higher up: `~/bin`, a dotfiles repo, a `claude-code`
+  slash command, or factoring into a tool the user can invoke from
+  any cwd.
+
+The branch annotation is best-effort *current* state, not the branch
+that was active when the command ran. Treat it as a hint, not a
+guarantee. cwd and repo path are captured at ingest time and are
+authoritative.
+
 # Output
 
 Your final output must be **only** a JSON array — no prose around it, no

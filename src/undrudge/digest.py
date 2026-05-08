@@ -21,12 +21,15 @@ secrets at this layer.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
+import subprocess
 from collections import Counter, defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from . import store
@@ -68,11 +71,12 @@ def render_daily(
     start_ts_ms = end_ts_ms - window_hours * 3600 * 1000
 
     stats = _stats(conn, start_ts_ms, end_ts_ms)
+    git_cache: dict[str, dict[str, str]] = {}
     parts: list[str] = []
     parts.append(_render_header(stats, start_ts_ms, end_ts_ms))
-    parts.append(_render_sessions(conn, start_ts_ms, end_ts_ms))
+    parts.append(_render_sessions(conn, start_ts_ms, end_ts_ms, git_cache))
     parts.append(_render_repeated_prompts(conn, start_ts_ms, end_ts_ms))
-    parts.append(_render_repeated_commands(conn, start_ts_ms, end_ts_ms))
+    parts.append(_render_repeated_commands(conn, start_ts_ms, end_ts_ms, git_cache))
     parts.append(_render_tool_ngrams(conn, start_ts_ms, end_ts_ms))
     parts.append(_render_error_chains(conn, start_ts_ms, end_ts_ms))
     return "\n".join(p for p in parts if p).rstrip() + "\n"
@@ -130,7 +134,12 @@ def _render_header(stats: DigestStats, start: int, end: int) -> str:
     )
 
 
-def _render_sessions(conn: sqlite3.Connection, start: int, end: int) -> str:
+def _render_sessions(
+    conn: sqlite3.Connection,
+    start: int,
+    end: int,
+    git_cache: dict[str, dict[str, str]],
+) -> str:
     rows = conn.execute(
         """SELECT m.session_id AS id,
                   s.project    AS project,
@@ -197,7 +206,7 @@ def _render_sessions(conn: sqlite3.Connection, start: int, end: int) -> str:
         # Shell commands run during this session's time range, attributed
         # by overlap. Best-effort temporal correlation, no fancy joins.
         cmd_rows = conn.execute(
-            """SELECT external_id, command, author FROM commands
+            """SELECT external_id, command, author, cwd FROM commands
                 WHERE ts BETWEEN ? AND ?
                 ORDER BY ts ASC LIMIT 5""",
             (r["first_ts"], r["last_ts"]),
@@ -211,8 +220,10 @@ def _render_sessions(conn: sqlite3.Connection, start: int, end: int) -> str:
                     if c["external_id"]
                     else ""
                 )
+                where = _format_inline_location(c["cwd"], git_cache)
                 out.append(
-                    f"  - [shell{handle} {tag}] `{_one_line(c['command'])[:140]}`"
+                    f"  - [shell{handle} {tag}]{where} "
+                    f"`{_one_line(c['command'])[:140]}`"
                 )
 
     return "\n".join(out) + "\n"
@@ -220,19 +231,24 @@ def _render_sessions(conn: sqlite3.Connection, start: int, end: int) -> str:
 
 def _render_repeated_prompts(conn: sqlite3.Connection, start: int, end: int) -> str:
     rows = conn.execute(
-        """SELECT id AS msg_id, session_id, text FROM messages
-             WHERE role = 'user' AND ts BETWEEN ? AND ?
-               AND text IS NOT NULL AND text != ''""",
+        """SELECT m.id AS msg_id, m.session_id AS sid, m.text AS text,
+                  s.project AS project
+             FROM messages m
+             LEFT JOIN sessions s ON s.id = m.session_id
+            WHERE m.role = 'user' AND m.ts BETWEEN ? AND ?
+              AND m.text IS NOT NULL AND m.text != ''""",
         (start, end),
     ).fetchall()
 
-    # (msg_id, session_id, text) per skeleton
-    buckets: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
+    # (msg_id, session_id, text, project) per skeleton
+    buckets: dict[str, list[tuple[str, str, str, str | None]]] = defaultdict(list)
     for r in rows:
         skeleton = canonicalize_prompt(r["text"])
         if not skeleton or len(skeleton) < 12:
             continue
-        buckets[skeleton].append((r["msg_id"], r["session_id"], r["text"]))
+        buckets[skeleton].append(
+            (r["msg_id"], r["sid"], r["text"], r["project"])
+        )
 
     repeats = sorted(
         ((sk, items) for sk, items in buckets.items() if len(items) >= MIN_REPEAT_COUNT),
@@ -244,20 +260,26 @@ def _render_repeated_prompts(conn: sqlite3.Connection, start: int, end: int) -> 
 
     out = ["## Repeated user-prompt skeletons"]
     for skeleton, items in repeats:
-        sessions = sorted({sid for _, sid, _ in items})
+        sessions = sorted({sid for _, sid, _, _ in items})
         sample = items[0][2]
-        handles = _format_handles("msg", (mid for mid, _, _ in items))
+        handles = _format_handles("msg", (mid for mid, _, _, _ in items))
+        projects = _format_project_summary(p for _, _, _, p in items)
         out.append(
-            f"- ×{len(items)} across {len(sessions)} session(s){handles}: "
-            f"`{_one_line(skeleton)[:160]}`"
+            f"- ×{len(items)} across {len(sessions)} session(s)"
+            f"{projects}{handles}: `{_one_line(skeleton)[:160]}`"
         )
         out.append(f"  - sample: {_quote_one_line(sample)}")
     return "\n".join(out) + "\n"
 
 
-def _render_repeated_commands(conn: sqlite3.Connection, start: int, end: int) -> str:
+def _render_repeated_commands(
+    conn: sqlite3.Connection,
+    start: int,
+    end: int,
+    git_cache: dict[str, dict[str, str]],
+) -> str:
     rows = conn.execute(
-        "SELECT external_id, command, author FROM commands WHERE ts BETWEEN ? AND ?",
+        "SELECT external_id, command, author, cwd FROM commands WHERE ts BETWEEN ? AND ?",
         (start, end),
     ).fetchall()
 
@@ -265,6 +287,7 @@ def _render_repeated_commands(conn: sqlite3.Connection, start: int, end: int) ->
     by_author: dict[str, Counter[str]] = defaultdict(Counter)
     sample: dict[str, str] = {}
     handles: dict[str, list[str]] = defaultdict(list)
+    cwd_counts: dict[str, Counter[str]] = defaultdict(Counter)
     for r in rows:
         cmd = r["command"]
         if not cmd:
@@ -277,6 +300,8 @@ def _render_repeated_commands(conn: sqlite3.Connection, start: int, end: int) ->
         sample.setdefault(skel, cmd)
         if r["external_id"]:
             handles[skel].append(r["external_id"])
+        if r["cwd"]:
+            cwd_counts[skel][r["cwd"]] += 1
 
     repeats = [
         (skel, count) for skel, count in counter.most_common(MAX_REPEATED_COMMANDS)
@@ -289,7 +314,11 @@ def _render_repeated_commands(conn: sqlite3.Connection, start: int, end: int) ->
     for skel, count in repeats:
         breakdown = _format_author_breakdown(by_author[skel])
         ref = _format_handles("shell", handles[skel])
-        out.append(f"- ×{count}{breakdown}{ref}: `{_one_line(skel)[:200]}`")
+        location = _format_cwd_summary(cwd_counts[skel], git_cache)
+        out.append(
+            f"- ×{count}{breakdown}{location}{ref}: "
+            f"`{_one_line(skel)[:200]}`"
+        )
         if sample[skel] != skel:
             out.append(f"  - sample: `{_one_line(sample[skel])[:200]}`")
     return "\n".join(out) + "\n"
@@ -491,6 +520,120 @@ def _format_handles(kind: str, ids: Iterable[str]) -> str:
         if len(seen) >= MAX_HANDLES_PER_CLUSTER:
             break
     return f" [{kind} #{' '.join(seen)}]" if seen else ""
+
+
+# --------------------------------------------------------------------------
+# Location enrichment (cwd → git repo + branch)
+# --------------------------------------------------------------------------
+
+# Best-effort means: this is the repo state *now*, not necessarily when
+# the command ran. Branches change. Document this in the prompt so the
+# LLM uses location as a hint, not as a guarantee. cwd itself, on the
+# other hand, is captured at ingest time and is authoritative.
+_GIT_LOOKUP_TIMEOUT_S = 2.0
+
+
+def _git_context(
+    cwd: str | None, cache: dict[str, dict[str, str]]
+) -> dict[str, str]:
+    """Return ``{'repo': <toplevel>, 'branch': <current>}`` for a cwd, or {}.
+
+    Best-effort: returns empty dict if the dir is gone, isn't a git repo,
+    git isn't on PATH, or the lookup times out. Cached per-cwd within a
+    single render so we don't shell out for every row in a cluster.
+    """
+    if not cwd:
+        return {}
+    if cwd in cache:
+        return cache[cwd]
+    out: dict[str, str] = {}
+    try:
+        if Path(cwd).is_dir():
+            r = subprocess.run(
+                ["git", "-C", cwd, "rev-parse",
+                 "--show-toplevel", "--abbrev-ref", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=_GIT_LOOKUP_TIMEOUT_S,
+                check=False,
+            )
+            if r.returncode == 0:
+                lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+                if len(lines) >= 1:
+                    out["repo"] = lines[0]
+                if len(lines) >= 2 and lines[1] != "HEAD":
+                    out["branch"] = lines[1]
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    cache[cwd] = out
+    return out
+
+
+def _shorten_path(p: str) -> str:
+    """Replace $HOME with ~ for a tighter display path."""
+    home = os.path.expanduser("~")
+    if home and p.startswith(home):
+        return "~" + p[len(home):]
+    return p
+
+
+def _render_location(cwd: str, ctx: dict[str, str]) -> str:
+    """Format a location as `repo-name [branch]` or shortened cwd."""
+    repo = ctx.get("repo")
+    if repo:
+        repo_name = Path(repo).name or repo
+        branch = ctx.get("branch")
+        return f"`{repo_name}`" + (f" [{branch}]" if branch else "")
+    return f"`{_shorten_path(cwd)}`"
+
+
+def _format_inline_location(
+    cwd: str | None, cache: dict[str, dict[str, str]]
+) -> str:
+    """Compact location annotation for per-row digest lines."""
+    if not cwd:
+        return ""
+    ctx = _git_context(cwd, cache)
+    return f" in {_render_location(cwd, ctx)}"
+
+
+def _format_cwd_summary(
+    counts: Counter[str], cache: dict[str, dict[str, str]]
+) -> str:
+    """Cluster-level location summary across the cwds where the pattern hit."""
+    if not counts:
+        return ""
+    if len(counts) == 1:
+        cwd = next(iter(counts))
+        return f" in {_render_location(cwd, _git_context(cwd, cache))}"
+    items = counts.most_common()
+    head = items[: MAX_HANDLES_PER_CLUSTER]
+    rendered = ", ".join(
+        f"{_render_location(cwd, _git_context(cwd, cache))}×{n}"
+        for cwd, n in head
+    )
+    rest = sum(n for _, n in items[MAX_HANDLES_PER_CLUSTER:])
+    suffix = f" +{rest} in {len(items) - MAX_HANDLES_PER_CLUSTER} more" if rest else ""
+    return f" across {len(items)} dirs ({rendered}{suffix})"
+
+
+def _format_project_summary(projects: Iterable[str | None]) -> str:
+    """Cluster-level project annotation for repeated-prompt clusters."""
+    counts: Counter[str] = Counter()
+    for p in projects:
+        if p:
+            counts[p] += 1
+    if not counts:
+        return ""
+    items = counts.most_common()
+    if len(items) == 1:
+        proj = items[0][0]
+        return f" in `{Path(proj).name or proj}`"
+    head = items[: MAX_HANDLES_PER_CLUSTER]
+    rendered = ", ".join(f"`{Path(p).name or p}`×{n}" for p, n in head)
+    rest = sum(n for _, n in items[MAX_HANDLES_PER_CLUSTER:])
+    suffix = f" +{rest} in {len(items) - MAX_HANDLES_PER_CLUSTER} more" if rest else ""
+    return f" across {len(items)} projects ({rendered}{suffix})"
 
 
 def _fmt_ts(ms: int) -> str:

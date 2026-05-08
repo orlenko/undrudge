@@ -154,6 +154,11 @@ def test_digest_finds_repeated_user_prompts(seeded_db: sqlite3.Connection):
     md = digest.render_daily(seeded_db, end_ts_ms=1_000_001_000_000, window_hours=24 * 365)
     assert "## Repeated user-prompt skeletons" in md
     assert "look at pr <n>" in md.lower()
+    # Project annotation: "Look at PR <n>" hits in /repo/foo (2x) and
+    # /repo/bar (1x), so the cluster line should call out both projects.
+    section = md.split("## Repeated user-prompt skeletons", 1)[1].split("##", 1)[0]
+    assert "across 2 projects" in section
+    assert "foo" in section and "bar" in section
 
 
 def test_digest_finds_repeated_shell_skeleton(seeded_db: sqlite3.Connection):
@@ -201,4 +206,72 @@ def test_digest_empty_window_renders_header_only(tmp_path: Path):
     # No noisy empty section headings:
     assert "## Sessions" not in md
     assert "## Repeated" not in md
+    conn.close()
+
+
+# --------------------------------------------------------------------------
+# Location enrichment
+# --------------------------------------------------------------------------
+
+
+def _init_repo(tmp_path: Path, branch: str = "main") -> Path:
+    """Create a minimal git repo with one commit on the given branch."""
+    import subprocess
+    repo = tmp_path / "demo-repo"
+    repo.mkdir()
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+           "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"}
+    subprocess.run(["git", "init", "-q", "-b", branch, str(repo)],
+                   check=True, env=env)
+    (repo / "README").write_text("hi\n")
+    subprocess.run(["git", "-C", str(repo), "add", "README"],
+                   check=True, env=env)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"],
+                   check=True, env=env)
+    return repo
+
+
+def test_git_context_returns_repo_and_branch_for_real_repo(tmp_path: Path):
+    repo = _init_repo(tmp_path, branch="trunk")
+    cache: dict[str, dict[str, str]] = {}
+    ctx = digest._git_context(str(repo), cache)
+    assert Path(ctx["repo"]).resolve() == repo.resolve()
+    assert ctx["branch"] == "trunk"
+    # Cached: second call should not re-shell-out (we just check it
+    # returns the same object reference).
+    assert digest._git_context(str(repo), cache) is ctx
+
+
+def test_git_context_returns_empty_for_nonexistent_cwd(tmp_path: Path):
+    cache: dict[str, dict[str, str]] = {}
+    assert digest._git_context(str(tmp_path / "nope"), cache) == {}
+
+
+def test_git_context_returns_empty_for_non_repo_dir(tmp_path: Path):
+    cache: dict[str, dict[str, str]] = {}
+    assert digest._git_context(str(tmp_path), cache) == {}
+
+
+def test_render_repeated_commands_surfaces_cwd_summary(tmp_path: Path):
+    """Cluster line for a repeated shell skeleton should call out cwd(s)."""
+    conn = store.init(tmp_path / "u.sqlite")
+    cmds = [
+        ("atuin", "h1", 1_000_000_000_500, "find . -name 'a' | xargs grep 'x'", "/foo/repo-a", None),
+        ("atuin", "h2", 1_000_000_010_500, "find . -name 'b' | xargs grep 'y'", "/foo/repo-a", None),
+        ("atuin", "h3", 1_000_000_020_500, "find . -name 'c' | xargs grep 'z'", "/foo/repo-b", None),
+    ]
+    for source, ext_id, ts, command, cwd, author in cmds:
+        conn.execute(
+            "INSERT INTO commands(source, external_id, ts, command, cwd, author) "
+            "VALUES (?,?,?,?,?,?)",
+            (source, ext_id, ts, command, cwd, author),
+        )
+    md = digest.render_daily(conn, end_ts_ms=1_000_001_000_000, window_hours=24)
+    section = md.split("## Repeated shell commands", 1)[1]
+    assert "across 2 dirs" in section
+    # Both cwds (or their basenames) should be present in the rendering;
+    # neither dir exists on disk so we fall back to the shortened cwd.
+    assert "repo-a" in section
+    assert "repo-b" in section
     conn.close()
