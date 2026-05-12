@@ -38,6 +38,13 @@ touch -a "$HOME/.claude.lock"
 # Profile is shipped as the `always-further/claude` pack on nono ≥ 0.48
 # (built-in `claude-code` was removed in 0.48). Install once with:
 #     nono pull always-further/claude
+# claude-code probes /home on startup (Linux-shaped code path; /home
+# doesn't even exist on macOS). nono 0.49 promoted that path from
+# "noisy warning" to "permanently restricted", which kills the whole
+# sandbox non-deterministically. --override-deny lifts the restriction
+# and --read grants read-only access; the path may not exist, in which
+# case the grant is a no-op but the override still suppresses the
+# permanent denial.
 exec nono run \
   --allow-cwd \
   --allow "$HOME/.claude" \
@@ -46,5 +53,6 @@ exec nono run \
   --allow "$HOME/.local/share/undrudge" \
   --read-file "$HOME/.gitconfig" \
   --read "$HOME/.config/configstore" \
+  --override-deny /home --read /home \
   --profile claude \
   -- env "COLUMNS=$COLS" "LINES=$ROWS" claude --dangerously-skip-permissions "$@"
