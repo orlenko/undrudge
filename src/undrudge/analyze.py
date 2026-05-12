@@ -29,7 +29,7 @@ from pathlib import Path
 
 from . import config as cfg_mod
 from . import digest as digest_mod
-from . import llm, recommend
+from . import events, llm, recommend
 
 PROMPT_TEMPLATE = "analyze.md"
 DEFAULT_TIMEOUT = 600  # claude -p with a chunky prompt routinely needs minutes
@@ -423,8 +423,38 @@ def run(
         )
         if result.inserted:
             written.append(result)
+            events.record(
+                cfg.paths.events_log,
+                "rec_written",
+                {
+                    "id": result.fingerprint,
+                    "scope": rec.scope,
+                    "title": rec.title,
+                    "signature": rec.signature,
+                    "automation_form": rec.automation_form,
+                    "confidence": rec.confidence,
+                    "path": str(result.path) if result.path else None,
+                    "evidence_refs_count": len(rec.evidence_refs or []),
+                },
+                conn=conn,
+            )
         else:
             skipped += 1
+    events.record(
+        cfg.paths.events_log,
+        "analyze_complete",
+        {
+            "scope": scope,
+            "window_hours": window_hours,
+            "parsed": len(recs),
+            "written": len(written),
+            "skipped": skipped,
+            "refs_total": refs_total,
+            "refs_resolved": refs_resolved,
+            "workdir": str(workdir),
+        },
+        conn=conn,
+    )
     return AnalyzeResult(prompt=prompt, response=response, parsed=recs,
                          written=written, skipped=skipped,
                          refs_total=refs_total,

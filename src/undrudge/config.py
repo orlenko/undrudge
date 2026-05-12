@@ -36,6 +36,7 @@ class Paths:
     recs_dir: Path
     digests_dir: Path
     logs_dir: Path
+    events_log: Path  # append-only JSONL audit trail
 
 
 @dataclass
@@ -87,6 +88,7 @@ def default_config() -> Config:
             recs_dir=data / "recommendations",
             digests_dir=data / "digests",
             logs_dir=data / "logs",
+            events_log=data / "events.jsonl",
         ),
         claude=Claude(projects_root=_expand("~/.claude/projects")),
         atuin=Atuin(db=_expand("~/.local/share/atuin/history.db")),
@@ -109,6 +111,7 @@ def load(path: Path | None = None) -> Config:
             recs_dir=_expand(p.get("recs_dir", cfg.paths.recs_dir)),
             digests_dir=_expand(p.get("digests_dir", cfg.paths.digests_dir)),
             logs_dir=_expand(p.get("logs_dir", cfg.paths.logs_dir)),
+            events_log=_expand(p.get("events_log", cfg.paths.events_log)),
         )
     if "claude" in raw:
         c = raw["claude"]
@@ -148,6 +151,9 @@ db          = "{cfg.paths.db}"
 recs_dir    = "{cfg.paths.recs_dir}"
 digests_dir = "{cfg.paths.digests_dir}"
 logs_dir    = "{cfg.paths.logs_dir}"
+# Append-only JSONL audit trail. One line per event:
+# rec_written / rec_dismissed / rec_implemented / analyze_complete.
+events_log  = "{cfg.paths.events_log}"
 
 [claude]
 projects_root = "{cfg.claude.projects_root}"

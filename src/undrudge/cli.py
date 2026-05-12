@@ -14,6 +14,7 @@ from . import (
     analyze,
     config,
     digest,
+    events,
     ingest_claude,
     ingest_shell,
     llm,
@@ -220,6 +221,15 @@ def _cmd_set_status(args: argparse.Namespace, *, new_status: str) -> int:
         print(f"no recommendation matches id prefix {args.id!r}", file=sys.stderr)
         return 1
 
+    events.record(
+        cfg.paths.events_log,
+        f"rec_{new_status}",
+        {
+            "id": result.matched_id,
+            "from_status": result.old_status,
+            "body_path": str(result.body_path) if result.body_path else None,
+        },
+    )
     print(f"{result.matched_id[:12]}: {result.old_status} → {result.new_status}")
     if result.body_path:
         print(f"  {result.body_path}")

@@ -390,6 +390,7 @@ def _mk_cfg(tmp_path: Path) -> config.Config:
             recs_dir=tmp_path / "recs",
             digests_dir=tmp_path / "digests",
             logs_dir=tmp_path / "logs",
+            events_log=tmp_path / "events.jsonl",
         ),
         claude=config.Claude(projects_root=tmp_path / "claude"),
         atuin=config.Atuin(db=tmp_path / "atuin.db"),
@@ -472,6 +473,30 @@ def test_run_persists_response_even_on_parse_failure(tmp_path: Path):
     # test because the invoker is a constant function.
     assert (workdir / "repair-prompt.md").exists()
     assert (workdir / "response.txt").read_text() == "garbage that is not json"
+
+
+def test_run_emits_events_to_events_log(tmp_path: Path):
+    """analyze.run writes one rec_written per inserted rec plus an
+    analyze_complete summary line."""
+    cfg = _mk_cfg(tmp_path)
+    conn = store.init(cfg.paths.db)
+    response = json.dumps([
+        {"title": "alpha", "signature": "a", "body_markdown": "x"},
+        {"title": "beta", "signature": "b", "body_markdown": "y"},
+    ])
+    workdir = tmp_path / "wd"
+    analyze.run(conn, cfg, invoker=lambda _: response, workdir=workdir)
+
+    log_lines = cfg.paths.events_log.read_text().splitlines()
+    entries = [json.loads(ln) for ln in log_lines]
+    # 2 rec_written + 1 analyze_complete (events are append-ordered).
+    kinds = [e["event"] for e in entries]
+    assert kinds.count("rec_written") == 2
+    assert kinds.count("analyze_complete") == 1
+    completed = next(e for e in entries if e["event"] == "analyze_complete")
+    assert completed["parsed"] == 2
+    assert completed["written"] == 2
+    assert completed["skipped"] == 0
 
 
 def test_run_recovers_when_repair_attempt_returns_valid_json(tmp_path: Path):
