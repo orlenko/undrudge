@@ -467,7 +467,44 @@ def test_run_persists_response_even_on_parse_failure(tmp_path: Path):
         )
     # Even though parsing failed, prompt + response are on disk for debugging.
     assert (workdir / "prompt.md").exists()
+    # The repair attempt persisted its own prompt and overwrote response.txt
+    # with the (still bad) second attempt — both have the same text in this
+    # test because the invoker is a constant function.
+    assert (workdir / "repair-prompt.md").exists()
     assert (workdir / "response.txt").read_text() == "garbage that is not json"
+
+
+def test_run_recovers_when_repair_attempt_returns_valid_json(tmp_path: Path):
+    """First invoker call returns garbage; second (repair) returns valid JSON."""
+    cfg = _mk_cfg(tmp_path)
+    conn = store.init(cfg.paths.db)
+    workdir = tmp_path / "wd"
+    calls = {"n": 0}
+
+    def flaky(prompt: str) -> str:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "this is not json, sorry"
+        # Second call sees the repair prompt and returns a clean array.
+        assert "could not be parsed as a JSON array" in prompt
+        return '[{"title": "x", "signature": "y", "body_markdown": "b"}]'
+
+    result = analyze.run(conn, cfg, invoker=flaky, workdir=workdir)
+    assert calls["n"] == 2
+    assert len(result.parsed) == 1
+    assert result.parsed[0].title == "x"
+    assert (workdir / "repair-prompt.md").exists()
+
+
+def test_run_surfaces_original_error_when_repair_also_fails(tmp_path: Path):
+    """Both invoker calls return garbage → original ValueError is raised."""
+    cfg = _mk_cfg(tmp_path)
+    conn = store.init(cfg.paths.db)
+    workdir = tmp_path / "wd"
+    with pytest.raises(ValueError, match="no JSON array"):
+        analyze.run(
+            conn, cfg, invoker=lambda _: "still not json", workdir=workdir,
+        )
 
 
 def test_file_based_invoker_uses_response_file(tmp_path: Path):

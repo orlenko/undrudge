@@ -185,6 +185,40 @@ _FENCE_RE = re.compile(
 )
 
 
+def _build_repair_prompt(
+    original_prompt: str, bad_response: str, err: Exception
+) -> str:
+    """Compose a follow-up that asks the LLM to fix its own JSON.
+
+    Keeps the original instructions verbatim so the LLM still has the
+    full context, but prefaces them with the failing attempt and the
+    parser's complaint. One-shot retry; the harness gives up after the
+    second parse failure.
+    """
+    snippet = bad_response.strip()
+    if len(snippet) > 4000:
+        snippet = snippet[:4000] + "\n…(truncated)"
+    return (
+        "Your previous response could not be parsed as a JSON array.\n"
+        f"Parser error: {type(err).__name__}: {err}\n"
+        "\n"
+        "Previous response (verbatim):\n"
+        "```\n"
+        f"{snippet}\n"
+        "```\n"
+        "\n"
+        "Re-emit a corrected response. Same constraints as before — a "
+        "bare JSON array, no prose, no fences, each element matching "
+        "the schema below. If your earlier judgment was right and the "
+        "format was the only problem, fix the format and keep the "
+        "content. If you can't recover meaningful output, return `[]`.\n"
+        "\n"
+        "Original instructions (for reference):\n"
+        "---\n"
+        f"{original_prompt}\n"
+    )
+
+
 def extract_json_array(text: str) -> list[dict]:
     """Pull a JSON array out of an LLM response.
 
@@ -333,7 +367,22 @@ def run(
         # can `cat <workdir>/response.txt` and see what happened.
         (workdir / "response.txt").write_text(response or "")
 
-    items = extract_json_array(response)
+    try:
+        items = extract_json_array(response)
+    except ValueError as first_err:
+        # Repair attempt: hand the bad output back to claude with a
+        # tight "this isn't valid JSON, fix it" prompt. One retry only;
+        # if the second attempt fails, surface the original error.
+        repair_prompt = _build_repair_prompt(prompt, response, first_err)
+        (workdir / "repair-prompt.md").write_text(repair_prompt)
+        repair_response = invoker(repair_prompt)
+        # Overwrite response.txt with the (hopefully valid) repair so
+        # the persisted-on-failure file matches what we'd parse.
+        (workdir / "response.txt").write_text(repair_response or "")
+        try:
+            items = extract_json_array(repair_response)
+        except ValueError:
+            raise first_err from None
     recs = to_recommendations(items, scope=scope)
 
     refs_resolved, refs_total = 0, 0

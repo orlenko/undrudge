@@ -11,16 +11,27 @@
 # the keychain, etc.
 set -euo pipefail
 
+# Deterministic-headless flags for `claude`:
+#   --bare                   skip hooks, LSP, plugin sync, auto-memory,
+#                            keychain, and CLAUDE.md auto-discovery —
+#                            none of which the analyzer needs, and all
+#                            of which add startup latency and
+#                            non-determinism to a one-shot -p call.
+#   --no-session-persistence don't write a session record to disk;
+#                            each analyze run is independent.
+# Used everywhere we invoke claude below.
+CLAUDE_FLAGS=(--dangerously-skip-permissions --bare --no-session-persistence)
+
 # Re-entry guard: don't double-sandbox. nono propagates NONO_CAP_FILE to
 # every contained process; if we're already inside, exec claude directly.
 if [[ -n "${NONO_CAP_FILE:-}" ]]; then
-  exec claude --dangerously-skip-permissions "$@"
+  exec claude "${CLAUDE_FLAGS[@]}" "$@"
 fi
 
 # Fallthrough: if nono isn't installed, just run claude. The script remains
 # safe to call from any machine.
 if ! command -v nono >/dev/null 2>&1; then
-  exec claude --dangerously-skip-permissions "$@"
+  exec claude "${CLAUDE_FLAGS[@]}" "$@"
 fi
 
 # ccstatusline reads $COLUMNS / $LINES; nono strips them. tput falls back
@@ -41,10 +52,10 @@ touch -a "$HOME/.claude.lock"
 # claude-code probes /home on startup (Linux-shaped code path; /home
 # doesn't even exist on macOS). nono 0.49 promoted that path from
 # "noisy warning" to "permanently restricted", which kills the whole
-# sandbox non-deterministically. --override-deny lifts the restriction
-# and --read grants read-only access; the path may not exist, in which
-# case the grant is a no-op but the override still suppresses the
-# permanent denial.
+# sandbox non-deterministically. --bypass-protection lifts the
+# restriction and --read grants read-only access; the path may not
+# exist on macOS but the override still suppresses the permanent
+# denial. (Was --override-deny in 0.48; renamed in 0.49.)
 exec nono run \
   --allow-cwd \
   --allow "$HOME/.claude" \
@@ -53,6 +64,6 @@ exec nono run \
   --allow "$HOME/.local/share/undrudge" \
   --read-file "$HOME/.gitconfig" \
   --read "$HOME/.config/configstore" \
-  --override-deny /home --read /home \
+  --bypass-protection /home --read /home \
   --profile claude \
-  -- env "COLUMNS=$COLS" "LINES=$ROWS" claude --dangerously-skip-permissions "$@"
+  -- env "COLUMNS=$COLS" "LINES=$ROWS" claude "${CLAUDE_FLAGS[@]}" "$@"
