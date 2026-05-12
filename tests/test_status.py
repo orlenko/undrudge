@@ -109,6 +109,27 @@ def test_resolve_evidence_refs_treats_ambiguous_prefix_as_unresolved(
     assert (resolved, total) == (0, 1)
 
 
+def test_frontmatter_includes_target_scope(tmp_path: Path):
+    conn = store.init(tmp_path / "u.sqlite")
+    rec = recommend.Recommendation(
+        title="x", body_markdown="b", signature="sig",
+        target_scope="cross_cutting",
+    )
+    result = recommend.write(conn, rec, recs_dir=tmp_path / "recs")
+    text = result.path.read_text()
+    fm = json.loads(text.split("```\n", 2)[0].removeprefix("```json\n"))
+    assert fm["target_scope"] == "cross_cutting"
+
+
+def test_frontmatter_defaults_target_scope_to_single_repo(tmp_path: Path):
+    conn = store.init(tmp_path / "u.sqlite")
+    rec = recommend.Recommendation(title="x", body_markdown="b", signature="sig")
+    result = recommend.write(conn, rec, recs_dir=tmp_path / "recs")
+    text = result.path.read_text()
+    fm = json.loads(text.split("```\n", 2)[0].removeprefix("```json\n"))
+    assert fm["target_scope"] == "single_repo"
+
+
 def test_frontmatter_includes_evidence_refs_when_present(tmp_path: Path):
     conn = store.init(tmp_path / "u.sqlite")
     rec = recommend.Recommendation(

@@ -148,6 +148,7 @@ Each element has exactly these fields:
                     form (slash command body, alias, script outline)",
   "signature": "normalized pattern string, e.g. \"find . -name <str> | xargs grep <str>\"",
   "automation_form": "slash_command | script | hook | shell_alias | extend_existing | other",
+  "target_scope": "single_repo | cross_cutting | agent_global",
   "confidence": "high | medium | low",
   "evidence": ["short strings citing the supporting observations"],
   "evidence_refs": [
@@ -158,6 +159,27 @@ Each element has exactly these fields:
   "rationale": "one short sentence"
 }
 ```
+
+The `target_scope` field maps directly to the cwd/project signal from
+the digest's location annotations:
+
+- `single_repo` — the pattern only showed up in one repo. The automation
+  should live inside that repo (e.g. `scripts/foo.sh` next to existing
+  scripts).
+- `cross_cutting` — the pattern hit multiple repos. The automation
+  should live somewhere shared (`~/bin/`, a dotfiles repo, a shell
+  alias in `~/.zshrc`).
+- `agent_global` — the pattern is about how *Claude Code itself*
+  behaves across projects. The automation lives in `~/.claude/commands/`
+  (slash commands), `~/.claude/agents/` (custom agents), or similar.
+  Use this when the rec is "give your agent a name for this", not
+  "give your shell a helper."
+
+Default to `single_repo` only if you're confident the rec belongs in
+exactly one repo. When in doubt between two, prefer the broader one
+(cross_cutting over single_repo, agent_global over cross_cutting) —
+users can always relocate a too-general helper, but a too-specific
+one in the wrong repo is harder to spot.
 
 If nothing in the digest rises above the trivia bar, return `[]`. Empty
 is a valid and honest answer.

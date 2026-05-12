@@ -47,6 +47,13 @@ class Recommendation:
     # at write time; unresolved refs are kept as-is and counted for
     # tuning the digest format.
     evidence_refs: list[dict[str, Any]] | None = None
+    # Where the proposed automation should live. Mirrors autoharness's
+    # `target_class` axis but framed for undrudge's location-aware
+    # analysis. "single_repo" = the rec belongs in one repo's scripts/;
+    # "cross_cutting" = the rec belongs in ~/bin or a shared dotfile;
+    # "agent_global" = ~/.claude/commands or a similar agent-wide
+    # location. Defaults to "single_repo" when the LLM doesn't specify.
+    target_scope: str = "single_repo"
     scope: str = "daily"
 
     def fingerprint(self) -> str:
@@ -126,6 +133,7 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _MAX_SLUG_LEN = 60
 _VALID_FORM = {"slash_command", "script", "hook", "shell_alias", "extend_existing", "other"}
 _VALID_CONFIDENCE = {"high", "medium", "low"}
+_VALID_SCOPE = {"single_repo", "cross_cutting", "agent_global"}
 
 
 def _slug(title: str) -> str:
@@ -151,6 +159,7 @@ def _frontmatter(rec: Recommendation, *, fingerprint: str, created: datetime) ->
     payload = {
         "id": fingerprint,
         "scope": rec.scope,
+        "target_scope": rec.target_scope,
         "status": "logged",
         "created": created.isoformat(timespec="seconds"),
         "confidence": rec.confidence,
@@ -182,6 +191,12 @@ def normalize(rec: Recommendation) -> Recommendation:
     confidence = rec.confidence.strip().lower() if rec.confidence else "medium"
     if confidence not in _VALID_CONFIDENCE:
         confidence = "medium"
+    target_scope = (
+        rec.target_scope.strip().lower().replace(" ", "_")
+        if rec.target_scope else "single_repo"
+    )
+    if target_scope not in _VALID_SCOPE:
+        target_scope = "single_repo"
     return Recommendation(
         title=rec.title.strip()[:200],
         body_markdown=rec.body_markdown.strip(),
@@ -191,6 +206,7 @@ def normalize(rec: Recommendation) -> Recommendation:
         rationale=rec.rationale.strip(),
         evidence=rec.evidence or [],
         evidence_refs=rec.evidence_refs,
+        target_scope=target_scope,
         scope=rec.scope,
     )
 

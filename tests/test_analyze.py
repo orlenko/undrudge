@@ -107,6 +107,19 @@ def test_to_recommendations_normalizes_invalid_enums():
     assert rec.confidence == "medium"
 
 
+def test_to_recommendations_captures_target_scope():
+    items = [
+        {"title": "x", "signature": "y", "target_scope": "cross_cutting"},
+        {"title": "y", "signature": "z", "target_scope": "AGENT_GLOBAL"},
+        {"title": "z", "signature": "w"},  # missing → default single_repo
+        {"title": "q", "signature": "r", "target_scope": "weird"},  # invalid → single_repo
+    ]
+    recs = [recommend.normalize(r) for r in analyze.to_recommendations(items, scope="daily")]
+    assert [r.target_scope for r in recs] == [
+        "cross_cutting", "agent_global", "single_repo", "single_repo"
+    ]
+
+
 def test_to_recommendations_captures_well_shaped_evidence_refs():
     items = [{
         "title": "x",

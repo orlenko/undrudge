@@ -297,6 +297,7 @@ def to_recommendations(items: list[dict], *, scope: str) -> list[recommend.Recom
                 rationale=str(item.get("rationale") or ""),
                 evidence=item.get("evidence") or [],
                 evidence_refs=clean_refs or None,
+                target_scope=str(item.get("target_scope") or "single_repo"),
                 scope=scope,
             )
         )
