@@ -150,6 +150,17 @@ def test_digest_lists_each_session(seeded_db: sqlite3.Connection):
     assert "/repo/bar" in md
 
 
+def test_digest_session_heading_carries_citable_handle(seeded_db: sqlite3.Connection):
+    """Each session block heading should expose `session #<handle>` so
+    the analyzer can cite the session as evidence_refs source=session."""
+    md = digest.render_daily(seeded_db, end_ts_ms=1_000_001_000_000, window_hours=24 * 365)
+    # Seeded session UUIDs start with 'aaaaaaaa' / 'bbbbbbbb'. After
+    # widening to a 12-char handle, the headings carry the explicit
+    # `session #...` tag so the LLM doesn't have to guess.
+    assert "session #aaaaaaaa" in md
+    assert "session #bbbbbbbb" in md
+
+
 def test_digest_finds_repeated_user_prompts(seeded_db: sqlite3.Connection):
     md = digest.render_daily(seeded_db, end_ts_ms=1_000_001_000_000, window_hours=24 * 365)
     assert "## Repeated user-prompt skeletons" in md

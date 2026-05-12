@@ -349,6 +349,11 @@ def resolve_evidence_refs(
                 "SELECT 1 FROM messages "
                 "WHERE REPLACE(id, '-', '') LIKE ? LIMIT 2"
             )
+        elif source in ("session", "claude-session"):
+            query = (
+                "SELECT 1 FROM sessions "
+                "WHERE REPLACE(id, '-', '') LIKE ? LIMIT 2"
+            )
         else:
             # Unknown source — can't resolve, don't count toward total either.
             continue

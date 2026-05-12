@@ -66,6 +66,22 @@ def test_resolve_evidence_refs_counts_unique_prefix_matches(tmp_path: Path):
     assert (resolved, total) == (2, 3)
 
 
+def test_resolve_evidence_refs_resolves_session_source(tmp_path: Path):
+    """source=session looks up sessions.id, not commands or messages."""
+    conn = store.init(tmp_path / "u.sqlite")
+    conn.execute(
+        "INSERT INTO sessions(id, project, started_at, last_seen) "
+        "VALUES (?, ?, ?, ?)",
+        ("b8d77c49-feed-face-cafe-decadebabe00", "/x", 1, 1),
+    )
+    refs = [
+        {"source": "session", "external_id": "b8d77c49feed"},   # 12-char prefix
+        {"source": "session", "external_id": "00000000dead"},   # no match
+    ]
+    resolved, total = recommend.resolve_evidence_refs(conn, refs)
+    assert (resolved, total) == (1, 2)
+
+
 def test_resolve_evidence_refs_strips_dashes_in_handles(tmp_path: Path):
     conn = store.init(tmp_path / "u.sqlite")
     _seed_evidence_rows(conn)

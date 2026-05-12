@@ -34,9 +34,18 @@ from typing import Any
 
 from . import store
 
+# Stable handles for [shell #...] / [msg #...] / [session #...] refs.
+# Was 8, but atuin ULIDs only carry ~8 bits of intra-millisecond
+# entropy in the first 8 chars — tight activity (npm install loops,
+# `gh pr` cycles inside a single session) routinely collided, so 5 of
+# every ~11 evidence_refs from the analyzer landed on ambiguous
+# prefixes and counted as unresolved. 12 chars adds two full base32
+# digits of random entropy past the millisecond timestamp without
+# making the handle ugly.
+HANDLE_PREFIX = 12
+SESSION_ID_PREFIX = HANDLE_PREFIX  # session headings reuse handle width
+
 DEFAULT_WINDOW_HOURS = 24
-SESSION_ID_PREFIX = 8         # short id width in the heading
-HANDLE_PREFIX = 8             # short id width for [shell #...] / [msg #...] refs
 TOP_TOOLS = 5
 PROMPT_HEAD_CHARS = 280
 MAX_SESSIONS_LISTED = 25
@@ -197,7 +206,10 @@ def _render_sessions(
             (sid, start, end),
         ).fetchone()
 
-        out.append(f"\n### {short} — {project} — {duration} — {r['msg_count']} msgs")
+        out.append(
+            f"\n### session #{short} — {project} — "
+            f"{duration} — {r['msg_count']} msgs"
+        )
         out.append(f"- top tools: {tools_str}")
         if first_user and first_user["text"]:
             out.append(f"- first user: {_quote_one_line(first_user['text'])}")

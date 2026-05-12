@@ -56,18 +56,25 @@ duplicate and skip.
 # Stable handles for evidence (probe phase)
 
 Many lines in the digest are tagged with stable handles you can cite
-back: `[shell #a4b9c2de]` for an atuin shell row, `[msg #a4b9c2de]`
-for a Claude message. The handle is an 8-char prefix of the row's
-underlying id; the harness resolves it back to a full row by prefix
-match. You'll see them next to repeated-command clusters, repeated
-prompt clusters, per-session shell samples, and tool errors.
+back. Three flavors:
+
+- `[shell #a4b9c2de1234]` — an atuin shell-command row. Use
+  `"source": "atuin"`.
+- `[msg #a4b9c2de1234]` — a Claude message. Use `"source": "claude"`.
+- `### session #a4b9c2de1234 — ...` — a Claude session heading.
+  Use `"source": "session"`. Cite this when the rec is about a whole
+  session (e.g., "this 15-hour run kept asking the same thing") more
+  than any one row inside it.
+
+The handle is a 12-character prefix of the row's id, stable across
+the digest. The harness resolves it back to a full row by prefix
+match.
 
 When you produce a recommendation, include `evidence_refs` (see
 schema below) listing the specific rows that triggered it. Cite the
 handle exactly as it appears in the digest (no leading `#`, no
-brackets). Each ref needs a `source` (`"atuin"` for shell, `"claude"`
-for messages) and the handle as `external_id`. An optional `note`
-field can record why this row supports the rec.
+brackets). Each ref needs a `source` and the handle as `external_id`.
+An optional `note` field can record why this row supports the rec.
 
 If you can't cite specific rows for a given rec, return `evidence_refs:
 []`. Don't fabricate handles — the harness measures resolution rate
@@ -144,8 +151,9 @@ Each element has exactly these fields:
   "confidence": "high | medium | low",
   "evidence": ["short strings citing the supporting observations"],
   "evidence_refs": [
-    {"source": "atuin",  "external_id": "a4b9c2de", "note": "first hit"},
-    {"source": "claude", "external_id": "7f3a91b2", "note": "session opener"}
+    {"source": "atuin",   "external_id": "a4b9c2de1234", "note": "first hit"},
+    {"source": "claude",  "external_id": "7f3a91b2cdef", "note": "session opener"},
+    {"source": "session", "external_id": "b8d77c490011", "note": "whole 15h session is the evidence"}
   ],
   "rationale": "one short sentence"
 }
