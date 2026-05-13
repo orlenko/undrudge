@@ -12,15 +12,15 @@
 set -euo pipefail
 
 # Deterministic-headless flags for `claude`:
-#   --bare                   skip hooks, LSP, plugin sync, auto-memory,
-#                            keychain, and CLAUDE.md auto-discovery —
-#                            none of which the analyzer needs, and all
-#                            of which add startup latency and
-#                            non-determinism to a one-shot -p call.
 #   --no-session-persistence don't write a session record to disk;
 #                            each analyze run is independent.
-# Used everywhere we invoke claude below.
-CLAUDE_FLAGS=(--dangerously-skip-permissions --bare --no-session-persistence)
+# (We previously also pinned `--bare`, which disables hooks, LSP,
+# plugin sync, auto-memory, *and* keychain reads. The keychain disable
+# breaks OAuth-authenticated installs — claude refuses to start with
+# "Not logged in" unless ANTHROPIC_API_KEY is in the env. Dropping
+# --bare keeps the user's normal auth flow working at the cost of
+# slightly less determinism; revisit if we ever provision an API key.)
+CLAUDE_FLAGS=(--dangerously-skip-permissions --no-session-persistence)
 
 # Re-entry guard: don't double-sandbox. nono propagates NONO_CAP_FILE to
 # every contained process; if we're already inside, exec claude directly.
