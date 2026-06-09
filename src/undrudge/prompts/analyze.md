@@ -53,6 +53,20 @@ written in the last 30 days. Do not re-suggest any of them. If the
 underlying pattern is the same but the wording differs, treat it as a
 duplicate and skip.
 
+# Previously dismissed — do not re-propose variants
+
+The "Previously dismissed" section lists recommendations a human (or a
+triage session) already declined in the last 30 days, each with the
+reason it was declined. These are **stronger** than the logged list: a
+dismissal is an explicit "no", often against a standing constraint
+(e.g. "we don't want a background daemon"). Do not re-propose any of
+them, and do not propose a close rephrasing or a narrower/broader
+variant of the same underlying idea. If the dismissal reason reveals a
+constraint, respect that constraint for *new* recommendations too. When
+in doubt about whether a candidate is a variant of a dismissed rec,
+leave it out — the harness also suppresses near-duplicates of dismissed
+recs at write time, so re-proposing one is wasted effort.
+
 # Stable handles for evidence (probe phase)
 
 Many lines in the digest are tagged with stable handles you can cite
@@ -198,3 +212,7 @@ same placeholders the digest uses (`<n>`, `<path>`, `<str>`, `<url>`,
 ## Previously logged (last 30 days)
 
 {recent_recs}
+
+## Previously dismissed (last 30 days) — do not re-propose variants
+
+{dismissed_recs}

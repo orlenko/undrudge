@@ -144,7 +144,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
-def _check_gather_health(cfg: "config.Config", check) -> None:
+def _check_gather_health(cfg: config.Config, check) -> None:
     """Surface recent gather failures from events.jsonl.
 
     Silent hourly failure is how the atuin WAL race went unnoticed for
@@ -260,6 +260,14 @@ def _cmd_implement(args: argparse.Namespace) -> int:
     return _cmd_set_status(args, new_status="implemented")
 
 
+def _cmd_mark(args: argparse.Namespace) -> int:
+    """General status setter — covers dispatched/rejected (and any valid
+    status) that don't have a dedicated verb. The dispatch pipeline uses
+    this to mark recs dispatched/rejected with a reason.
+    """
+    return _cmd_set_status(args, new_status=args.status)
+
+
 def _cmd_show(args: argparse.Namespace) -> int:
     """Print the absolute path of the rec's markdown file. Cmd+click in
     iTerm2 (or pipe to your viewer of choice) takes it from there."""
@@ -294,13 +302,14 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
 
 def _cmd_set_status(args: argparse.Namespace, *, new_status: str) -> int:
+    reason = getattr(args, "reason", None)
     cfg = config.load()
     conn = store.open_db(cfg.paths.db)
     try:
         store.apply_schema(conn)
         try:
-            result = recommend.set_status(conn, args.id, new_status)
-        except LookupError as e:
+            result = recommend.set_status(conn, args.id, new_status, reason=reason)
+        except (LookupError, ValueError) as e:
             print(f"error: {e}", file=sys.stderr)
             return 2
     finally:
@@ -316,10 +325,13 @@ def _cmd_set_status(args: argparse.Namespace, *, new_status: str) -> int:
         {
             "id": result.matched_id,
             "from_status": result.old_status,
+            "reason": reason,
             "body_path": str(result.body_path) if result.body_path else None,
         },
     )
     print(f"{result.matched_id[:12]}: {result.old_status} → {result.new_status}")
+    if reason:
+        print(f"  reason: {reason}")
     if result.body_path:
         print(f"  {result.body_path}")
     return 0
@@ -341,10 +353,14 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             )
             recent = recommend.recent_logged(conn)
             recent_md = recommend.render_recent_for_prompt(recent)
+            dismissed_md = recommend.render_dismissed_for_prompt(
+                recommend.recent_dismissed(conn)
+            )
             sys.stdout.write(
                 analyze.build_prompt(
                     digest_md, recent_md,
                     scope="weekly" if meta else "daily",
+                    dismissed_md=dismissed_md,
                 )
             )
             return 0
@@ -553,8 +569,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_list = sub.add_parser("list", help="Show recommendations.")
     p_list.add_argument("--since", default=None,
                         help="Show recs newer than this (e.g. 7d, 24h, 2026-05-01).")
-    p_list.add_argument("--status", default=None,
-                        choices=["logged", "dismissed", "implemented"])
+    p_list.add_argument(
+        "--status", default=None,
+        choices=["logged", "dismissed", "implemented", "dispatched", "rejected"],
+    )
     p_list.add_argument("--scope", default=None,
                         choices=["daily", "weekly"])
     p_list.add_argument("--limit", default=200, type=int)
@@ -562,11 +580,37 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_dismiss = sub.add_parser("dismiss", help="Mark a recommendation dismissed.")
     p_dismiss.add_argument("id", help="Full id or unique prefix.")
+    p_dismiss.add_argument(
+        "--reason", default=None,
+        help="Why it's being dismissed. Fed back into the analyze prompt so "
+             "variants stop getting re-proposed.",
+    )
     p_dismiss.set_defaults(func=_cmd_dismiss)
 
     p_implement = sub.add_parser("implement", help="Mark a recommendation implemented.")
     p_implement.add_argument("id", help="Full id or unique prefix.")
+    p_implement.add_argument(
+        "--reason", default=None, help="Optional note recorded with the status flip.",
+    )
     p_implement.set_defaults(func=_cmd_implement)
+
+    p_mark = sub.add_parser(
+        "mark",
+        help="Set a recommendation's status to any valid value "
+             "(dispatched, rejected, etc.).",
+    )
+    p_mark.add_argument("id", help="Full id or unique prefix.")
+    p_mark.add_argument(
+        "status",
+        choices=["logged", "dismissed", "implemented", "dispatched", "rejected"],
+        help="New status.",
+    )
+    p_mark.add_argument(
+        "--reason", default=None,
+        help="Why. Persisted to frontmatter + events.jsonl; negative "
+             "statuses feed the analyze prompt's do-not-re-propose section.",
+    )
+    p_mark.set_defaults(func=_cmd_mark)
 
     p_show = sub.add_parser(
         "show",

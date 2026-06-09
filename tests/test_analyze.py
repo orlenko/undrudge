@@ -36,6 +36,22 @@ def test_build_prompt_substitutes_in_order():
     assert "{tool_meta_section}" not in prompt
 
 
+def test_build_prompt_substitutes_dismissed_section():
+    prompt = analyze.build_prompt(
+        "D", "R", dismissed_md="DISMISSED_BODY"
+    )
+    assert "DISMISSED_BODY" in prompt
+    assert "{dismissed_recs}" not in prompt
+    # The do-not-re-propose guidance must survive in the template.
+    assert "do not re-propose variants" in prompt.lower()
+
+
+def test_build_prompt_dismissed_defaults_to_placeholder():
+    prompt = analyze.build_prompt("D", "R")
+    assert "{dismissed_recs}" not in prompt
+    assert "no recently dismissed" in prompt
+
+
 def test_build_prompt_omits_tool_meta_on_daily():
     prompt = analyze.build_prompt("D", "R", scope="daily")
     assert "Tool meta-analysis" not in prompt
@@ -292,9 +308,11 @@ def test_write_distinguishes_unrelated_patterns(tmp_path: Path):
     assert b.inserted is True
 
 
-def test_write_fuzzy_dedupe_ignores_dismissed(tmp_path: Path):
-    """A fuzzy near-duplicate of a *dismissed* rec is allowed through —
-    the user's dismissal applies to the original, not to all rephrasings."""
+def test_write_fuzzy_dedupe_suppresses_variant_of_dismissed(tmp_path: Path):
+    """A fuzzy near-duplicate of a *dismissed* rec is suppressed at write
+    time — a dismissal is an explicit "no" that should apply to close
+    rephrasings too, not just the exact signature. This is the write-side
+    half of the dismissal-aware analyze change."""
     conn = store.init(tmp_path / "u.sqlite")
     a = recommend.write(
         conn,
@@ -306,9 +324,8 @@ def test_write_fuzzy_dedupe_ignores_dismissed(tmp_path: Path):
     )
     assert a.inserted is True
 
-    conn.execute(
-        "UPDATE recommendations SET status = 'dismissed' WHERE id = ?",
-        (a.fingerprint,),
+    recommend.set_status(
+        conn, a.fingerprint, "dismissed", reason="we don't grep like this"
     )
 
     b = recommend.write(
@@ -319,8 +336,69 @@ def test_write_fuzzy_dedupe_ignores_dismissed(tmp_path: Path):
         ),
         recs_dir=tmp_path / "recs",
     )
-    # Fuzzy lookup filters by status, so a similar-but-distinct rec
-    # against a dismissed one lands as a fresh insert.
+    assert b.inserted is False
+    assert b.skipped_reason is not None
+    assert "dismissed" in b.skipped_reason
+    # The dismissal reason rides along in the skip message for -v runs.
+    assert "we don't grep like this" in b.skipped_reason
+    # Suppression means no second row, and the result points back at the
+    # original dismissed rec — same rigor as the active-dup test.
+    assert conn.execute("SELECT COUNT(*) FROM recommendations").fetchone()[0] == 1
+    assert b.fingerprint == a.fingerprint
+
+
+def test_write_suppresses_variant_of_dispatched(tmp_path: Path):
+    """A dispatched rec is in-flight as a brief; a near-dup of it is
+    blocked through the *ordinary* active-duplicate path (not the
+    dismissed path), since dispatched is in ACTIVE_STATUSES."""
+    conn = store.init(tmp_path / "u.sqlite")
+    a = recommend.write(
+        conn,
+        recommend.Recommendation(
+            title="X", body_markdown="b",
+            signature="find . -name <str> | xargs grep <str>",
+        ),
+        recs_dir=tmp_path / "recs",
+    )
+    recommend.set_status(conn, a.fingerprint, "dispatched")
+
+    b = recommend.write(
+        conn,
+        recommend.Recommendation(
+            title="Y", body_markdown="b",
+            signature="find . -name <str> -type f | xargs grep <str>",
+        ),
+        recs_dir=tmp_path / "recs",
+    )
+    assert b.inserted is False
+    assert b.skipped_reason is not None
+    assert "near-duplicate" in b.skipped_reason
+    # Active-dup form, not the dismissed/rejected form.
+    assert "dismissed" not in b.skipped_reason
+    assert "rejected" not in b.skipped_reason
+
+
+def test_write_allows_unrelated_pattern_after_dismissal(tmp_path: Path):
+    """The dismissed-variant gate must not over-suppress: an *unrelated*
+    new rec still writes even when some other rec was dismissed."""
+    conn = store.init(tmp_path / "u.sqlite")
+    a = recommend.write(
+        conn,
+        recommend.Recommendation(
+            title="X", body_markdown="b",
+            signature="find . -name <str> | xargs grep <str>",
+        ),
+        recs_dir=tmp_path / "recs",
+    )
+    recommend.set_status(conn, a.fingerprint, "dismissed", reason="no")
+    b = recommend.write(
+        conn,
+        recommend.Recommendation(
+            title="Y", body_markdown="b",
+            signature="git rebase -i HEAD~<n>",
+        ),
+        recs_dir=tmp_path / "recs",
+    )
     assert b.inserted is True
 
 

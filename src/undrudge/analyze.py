@@ -67,7 +67,11 @@ def load_tool_meta_section() -> str:
 
 
 def build_prompt(
-    digest_md: str, recent_recs_md: str, *, scope: str = "daily"
+    digest_md: str,
+    recent_recs_md: str,
+    *,
+    scope: str = "daily",
+    dismissed_md: str = "_(no recently dismissed recommendations)_",
 ) -> str:
     tpl = load_prompt_template()
     # Tool meta-analysis is a weekly-only pass: per-pattern friction
@@ -78,6 +82,7 @@ def build_prompt(
         tpl
         .replace("{digest}", digest_md)
         .replace("{recent_recs}", recent_recs_md)
+        .replace("{dismissed_recs}", dismissed_md)
         .replace("{tool_meta_section}", meta)
     )
 
@@ -391,10 +396,15 @@ def run(
     )
     recent = recommend.recent_logged(conn)
     recent_md = recommend.render_recent_for_prompt(recent)
-    prompt = build_prompt(digest_md, recent_md, scope=scope)
+    dismissed = recommend.recent_dismissed(conn)
+    dismissed_md = recommend.render_dismissed_for_prompt(dismissed)
+    prompt = build_prompt(
+        digest_md, recent_md, scope=scope, dismissed_md=dismissed_md
+    )
     logger.info(
-        "prompt assembled: digest=%d chars, recent_recs=%d chars, prompt=%d chars",
-        len(digest_md), len(recent_md), len(prompt),
+        "prompt assembled: digest=%d chars, recent_recs=%d chars, "
+        "dismissed=%d, prompt=%d chars",
+        len(digest_md), len(recent_md), len(dismissed), len(prompt),
     )
 
     workdir = workdir or _new_run_workdir(cfg, suffix="dry" if dry_run else "")

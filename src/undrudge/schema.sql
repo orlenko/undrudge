@@ -78,6 +78,10 @@ CREATE TABLE IF NOT EXISTS recommendations (
   body_path    TEXT NOT NULL,
   evidence     TEXT NOT NULL,
   status       TEXT NOT NULL DEFAULT 'logged',
+  -- Free-text reason captured when a status flips away from 'logged'
+  -- (e.g. why a rec was dismissed/rejected). Fed back into the analyze
+  -- prompt so the LLM stops re-proposing variants of rejected ideas.
+  reason       TEXT,
   created_at   INTEGER NOT NULL,
   updated_at   INTEGER NOT NULL
 );

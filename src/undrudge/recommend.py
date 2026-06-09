@@ -93,25 +93,41 @@ def signature_similarity(a: str, b: str) -> float:
     ).ratio()
 
 
+# Active statuses block a new rec as an ordinary duplicate: the same
+# pattern is already live (logged), already built (implemented), or
+# already sent out as a brief (dispatched).
+ACTIVE_STATUSES = ("logged", "implemented", "dispatched")
+# Negative statuses mean a human (or a triage session) already said "no"
+# to this pattern. A close rephrasing should be suppressed at write time
+# AND surfaced to the analyze prompt as "previously dismissed".
+NEGATIVE_STATUSES = ("dismissed", "rejected")
+
+
 def find_similar(
     conn: sqlite3.Connection,
     *,
     scope: str,
     signature: str,
     threshold: float = SIGNATURE_SIMILARITY_THRESHOLD,
+    statuses: tuple[str, ...] = ACTIVE_STATUSES,
 ) -> dict[str, Any] | None:
     """Return the closest existing recommendation if its signature is
     near-identical to ``signature`` under the canonical form.
 
-    Only considers ``logged`` and ``implemented`` rows — dismissed recs
-    don't block a re-suggestion. Returns ``None`` if nothing crosses the
-    threshold.
+    ``statuses`` selects which rows are eligible to match. Defaults to the
+    active set (``logged``/``implemented``/``dispatched``) — the ordinary
+    "don't write a duplicate of a live rec" gate. Pass
+    ``NEGATIVE_STATUSES`` to instead find a near-match among
+    dismissed/rejected recs, so the writer can suppress re-proposed
+    variants of ideas a human already declined. Returns ``None`` if
+    nothing crosses the threshold.
     """
+    placeholders = ",".join("?" for _ in statuses)
     rows = conn.execute(
-        """SELECT id, signature, body_path, status
+        f"""SELECT id, signature, body_path, status, reason
              FROM recommendations
-            WHERE scope = ? AND status IN ('logged', 'implemented')""",
-        (scope,),
+            WHERE scope = ? AND status IN ({placeholders})""",
+        (scope, *statuses),
     ).fetchall()
 
     best_ratio = 0.0
@@ -257,6 +273,28 @@ def write(
             ),
         )
 
+    # Suppress re-proposed variants of recs a human already declined.
+    # A dismissed/rejected rec near-matching this signature means the LLM
+    # is rephrasing an idea that's already been said "no" to — don't
+    # re-surface it. The reason (if any) is carried in the skip message
+    # so a -v run shows *why* it was suppressed.
+    declined = find_similar(
+        conn, scope=rec.scope, signature=rec.signature,
+        statuses=NEGATIVE_STATUSES,
+    )
+    if declined is not None:
+        why = f"; reason: {declined['reason']}" if declined.get("reason") else ""
+        return WriteResult(
+            fingerprint=declined["id"],
+            path=Path(declined["body_path"]) if declined["body_path"] else None,
+            inserted=False,
+            skipped_reason=(
+                f"near-duplicate of {declined['status']} rec "
+                f"{declined['id'][:12]} (similarity={declined['similarity']:.2f})"
+                f"{why}"
+            ),
+        )
+
     created = now or datetime.now(UTC)
     day_dir = recs_dir / created.strftime("%Y-%m-%d")
     day_dir.mkdir(parents=True, exist_ok=True)
@@ -298,16 +336,23 @@ def write(
 def recent_logged(
     conn: sqlite3.Connection, *, days: int = 30, limit: int = 50
 ) -> list[dict[str, Any]]:
-    """Recent (logged or implemented) recs for prompt-time dedupe context."""
+    """Recent active recs for prompt-time dedupe context.
+
+    Active = logged / implemented / dispatched. A dispatched rec is
+    in-flight as a brief, so it's just as much a "don't re-suggest this"
+    signal as a logged one. Dismissed/rejected recs are handled
+    separately by ``recent_dismissed``.
+    """
     cutoff = store.now_ms() - days * 86400 * 1000
+    placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
     rows = conn.execute(
-        """SELECT id, title, signature, status, created_at
+        f"""SELECT id, title, signature, status, created_at
              FROM recommendations
             WHERE created_at >= ?
-              AND status IN ('logged', 'implemented')
+              AND status IN ({placeholders})
             ORDER BY created_at DESC
             LIMIT ?""",
-        (cutoff, limit),
+        (cutoff, *ACTIVE_STATUSES, limit),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -319,6 +364,43 @@ def render_recent_for_prompt(rows: Iterable[dict[str, Any]]) -> str:
     lines = []
     for r in rows:
         lines.append(f"- [{r['status']}] {r['title']} — `{r['signature']}`")
+    return "\n".join(lines)
+
+
+def recent_dismissed(
+    conn: sqlite3.Connection, *, days: int = 30, limit: int = 50
+) -> list[dict[str, Any]]:
+    """Recently declined recs (dismissed/rejected) with their reasons.
+
+    Filtered on ``updated_at`` (when the rec was declined), not
+    ``created_at`` — a rec created months ago but dismissed yesterday is
+    fresh, recurrence-relevant signal. Feeds the analyze prompt's
+    "previously dismissed — do not re-propose variants" section.
+    """
+    cutoff = store.now_ms() - days * 86400 * 1000
+    placeholders = ",".join("?" for _ in NEGATIVE_STATUSES)
+    rows = conn.execute(
+        f"""SELECT id, title, signature, status, reason, updated_at
+             FROM recommendations
+            WHERE updated_at >= ?
+              AND status IN ({placeholders})
+            ORDER BY updated_at DESC
+            LIMIT ?""",
+        (cutoff, *NEGATIVE_STATUSES, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def render_dismissed_for_prompt(rows: Iterable[dict[str, Any]]) -> str:
+    rows = list(rows)
+    if not rows:
+        return "_(no recently dismissed recommendations)_"
+    lines = []
+    for r in rows:
+        reason = (r.get("reason") or "").strip() or "(no reason given)"
+        lines.append(
+            f"- [{r['status']}] {r['title']} — `{r['signature']}` — {reason}"
+        )
     return "\n".join(lines)
 
 
@@ -385,7 +467,7 @@ def resolve_evidence_refs(
 # --------------------------------------------------------------------------
 
 
-_VALID_STATUS = {"logged", "dismissed", "implemented"}
+_VALID_STATUS = {"logged", "dismissed", "implemented", "dispatched", "rejected"}
 
 
 def list_recs(
@@ -424,6 +506,7 @@ class StatusUpdate:
     old_status: str | None
     new_status: str
     body_path: Path | None
+    reason: str | None = None
 
 
 def find_by_id_prefix(
@@ -440,26 +523,51 @@ def find_by_id_prefix(
 
 
 def set_status(
-    conn: sqlite3.Connection, id_prefix: str, new_status: str
+    conn: sqlite3.Connection,
+    id_prefix: str,
+    new_status: str,
+    *,
+    reason: str | None = None,
 ) -> StatusUpdate:
+    """Flip a rec's status. The single status-mutation path.
+
+    ``reason`` (free text, e.g. why a rec was dismissed/rejected) is
+    persisted to the DB ``reason`` column AND the on-disk frontmatter,
+    and surfaces back through the analyze prompt so the LLM stops
+    re-proposing variants of declined ideas. Passing ``reason=None``
+    leaves any existing reason untouched (a plain status flip).
+    """
     if new_status not in _VALID_STATUS:
         raise ValueError(
             f"invalid status {new_status!r}; expected one of {sorted(_VALID_STATUS)}"
         )
+    # A blank reason is treated as "no reason" — preserve any existing one
+    # rather than clobbering it with an empty string. This keeps `--reason ""`
+    # symmetric with omitting the flag, so the dispatch pipeline's
+    # flip-first-then-record flow can't accidentally wipe a recorded reason.
+    if reason is not None and not reason.strip():
+        reason = None
     matches = find_by_id_prefix(conn, id_prefix)
     if not matches:
         return StatusUpdate(matched_id=None, old_status=None,
-                            new_status=new_status, body_path=None)
+                            new_status=new_status, body_path=None, reason=reason)
     if len(matches) > 1:
         raise LookupError(
             f"id prefix {id_prefix!r} is ambiguous "
             f"({len(matches)} matches: {[m['id'][:12] for m in matches]})"
         )
     target = matches[0]
-    conn.execute(
-        "UPDATE recommendations SET status = ?, updated_at = ? WHERE id = ?",
-        (new_status, store.now_ms(), target["id"]),
-    )
+    if reason is not None:
+        conn.execute(
+            "UPDATE recommendations SET status = ?, reason = ?, updated_at = ? "
+            "WHERE id = ?",
+            (new_status, reason, store.now_ms(), target["id"]),
+        )
+    else:
+        conn.execute(
+            "UPDATE recommendations SET status = ?, updated_at = ? WHERE id = ?",
+            (new_status, store.now_ms(), target["id"]),
+        )
     body_path = Path(target["body_path"]) if target["body_path"] else None
 
     # Best-effort: rewrite the frontmatter status field on disk so the
@@ -467,18 +575,22 @@ def set_status(
     # has been hand-edited or moved.
     if body_path and body_path.exists():
         with contextlib.suppress(OSError, ValueError):
-            _rewrite_frontmatter_status(body_path, new_status)
+            _rewrite_frontmatter_status(body_path, new_status, reason=reason)
 
     return StatusUpdate(
         matched_id=target["id"],
         old_status=target["status"],
         new_status=new_status,
         body_path=body_path,
+        reason=reason,
     )
 
 
-def _rewrite_frontmatter_status(path: Path, new_status: str) -> None:
-    """Update the ``status`` field in a rec file's JSON header in-place.
+def _rewrite_frontmatter_status(
+    path: Path, new_status: str, *, reason: str | None = None
+) -> None:
+    """Update the ``status`` (and optionally ``reason``) field in a rec
+    file's JSON header in-place.
 
     Reads either the current ```json fence or the legacy YAML-style
     ``---`` fence (recs written before that change). Always writes back
@@ -498,5 +610,7 @@ def _rewrite_frontmatter_status(path: Path, new_status: str) -> None:
     rest = text[end + len(close_marker):]
     fm = json.loads(head)
     fm["status"] = new_status
+    if reason is not None:
+        fm["reason"] = reason
     new_head = json.dumps(fm, indent=2, default=str, ensure_ascii=False)
     path.write_text(f"```json\n{new_head}\n```\n{rest}")

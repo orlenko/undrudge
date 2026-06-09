@@ -151,8 +151,10 @@ db          = "{cfg.paths.db}"
 recs_dir    = "{cfg.paths.recs_dir}"
 digests_dir = "{cfg.paths.digests_dir}"
 logs_dir    = "{cfg.paths.logs_dir}"
-# Append-only JSONL audit trail. One line per event:
-# rec_written / rec_dismissed / rec_implemented / analyze_complete.
+# Append-only JSONL audit trail. One line per event: rec_written,
+# rec_<status> on a status flip (rec_dismissed / rec_implemented /
+# rec_dispatched / rec_rejected / rec_logged, carrying an optional
+# reason), analyze_complete, and gather_failed.
 events_log  = "{cfg.paths.events_log}"
 
 [claude]

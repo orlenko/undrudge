@@ -45,6 +45,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "author": "ALTER TABLE commands ADD COLUMN author TEXT",
         "intent": "ALTER TABLE commands ADD COLUMN intent TEXT",
     })
+    _ensure_columns(conn, "recommendations", {
+        "reason": "ALTER TABLE recommendations ADD COLUMN reason TEXT",
+    })
 
 
 def _ensure_columns(
