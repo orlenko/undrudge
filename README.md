@@ -93,6 +93,22 @@ to the values the schedulers use. Either flag can override the preset
 (e.g. `undrudge analyze week --window 14d`). Use `analyze` with no
 preset to keep the previous default (24h regular).
 
+### Verbose runs
+
+Every subcommand accepts a global `-v` / `-vv` before the command name
+for interactive narration on stderr. Quiet by default (cron stays clean).
+
+```bash
+undrudge -v gather              # which files, how many lines/rows
+undrudge -v analyze day         # prompt sizes, llm spawn, parse, per-rec writes
+undrudge -vv analyze day        # plus poll-level DEBUG detail
+```
+
+Verbose is the *transient* "what's happening right now" channel. The
+durable history channel is the JSONL audit trail at
+`~/.local/share/undrudge/events.jsonl` — that records rec writes,
+status changes, and analyze runs regardless of `-v`.
+
 If a scheduled run misses (laptop asleep, Claude API blip, you closed
 the lid), running these by hand replays them. Recs are deduplicated by
 fingerprint, so re-running is safe — duplicates just count as

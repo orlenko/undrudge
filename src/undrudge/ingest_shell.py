@@ -12,13 +12,15 @@ trivially safe — duplicates collapse via ``INSERT OR IGNORE``.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import sanitize, store
+
+logger = logging.getLogger(__name__)
 
 ATUIN_SOURCE = "atuin"
 
@@ -70,12 +72,17 @@ def ingest(
 ) -> ShellIngestStats:
     stats = ShellIngestStats()
     if not atuin_db_path.exists():
+        logger.info("atuin db missing: %s — skipping", atuin_db_path)
         return stats
 
     cursor_ns = _read_cursor(conn)
     stats.last_ts_ns = cursor_ns
-
+    logger.info(
+        "reading atuin from %s (cursor=%d ns)",
+        atuin_db_path, cursor_ns,
+    )
     rows = _read_atuin_rows_with_retry(atuin_db_path, cursor_ns)
+    logger.debug("atuin returned %d candidate rows", len(rows))
 
     max_ts_ns = cursor_ns
     for row in rows:
@@ -138,6 +145,10 @@ def ingest(
         _write_cursor(conn, max_ts_ns)
         stats.last_ts_ns = max_ts_ns
 
+    logger.info(
+        "atuin ingest done: seen=%d inserted=%d dropped=%d cursor=%d",
+        stats.rows_seen, stats.rows_inserted, stats.rows_dropped, stats.last_ts_ns,
+    )
     return stats
 
 
@@ -179,10 +190,9 @@ def _read_atuin_rows_with_retry(
             last_exc = e
             if attempt < _OPEN_ATTEMPTS - 1:
                 delay = _OPEN_BACKOFF_SECONDS * (2 ** attempt)
-                print(
-                    f"undrudge: atuin open failed ({e}); "
-                    f"retry {attempt + 1}/{_OPEN_ATTEMPTS - 1} in {delay:.0f}s",
-                    file=sys.stderr,
+                logger.warning(
+                    "atuin open failed (%s); retry %d/%d in %.0fs",
+                    e, attempt + 1, _OPEN_ATTEMPTS - 1, delay,
                 )
                 time.sleep(delay)
     assert last_exc is not None

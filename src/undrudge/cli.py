@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import shutil
 import sqlite3
 import sys
@@ -21,6 +22,41 @@ from . import (
     recommend,
     store,
 )
+
+
+class _ShortNameFormatter(logging.Formatter):
+    """Strip the ``undrudge.`` prefix from logger names for readability."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        record.short_name = record.name.removeprefix("undrudge.")
+        return super().format(record)
+
+
+def _setup_logging(verbosity: int) -> None:
+    """Configure the ``undrudge`` logger from a ``-v`` count.
+
+    0 = WARNING (default, silent), 1 = INFO, 2+ = DEBUG. The handler is
+    attached to the ``undrudge`` logger directly (not root) so we don't
+    leak narration from third-party libraries if any are added later.
+    All output goes to stderr; stdout is reserved for the tool's actual
+    payload (digest markdown, rec paths, etc.).
+    """
+    level = (
+        logging.WARNING if verbosity <= 0
+        else logging.INFO if verbosity == 1
+        else logging.DEBUG
+    )
+    logger = logging.getLogger("undrudge")
+    logger.setLevel(level)
+    # Don't stack handlers if main() is invoked more than once (tests).
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(
+        _ShortNameFormatter("%(levelname)-5s %(short_name)s: %(message)s")
+    )
+    logger.addHandler(handler)
+    logger.propagate = False
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
@@ -252,7 +288,12 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             )
             recent = recommend.recent_logged(conn)
             recent_md = recommend.render_recent_for_prompt(recent)
-            sys.stdout.write(analyze.build_prompt(digest_md, recent_md))
+            sys.stdout.write(
+                analyze.build_prompt(
+                    digest_md, recent_md,
+                    scope="weekly" if meta else "daily",
+                )
+            )
             return 0
 
         result = analyze.run(
@@ -367,6 +408,10 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Background watchman that finds what to automate.",
     )
     p.add_argument("--version", action="version", version=f"undrudge {__version__}")
+    p.add_argument(
+        "-v", "--verbose", action="count", default=0,
+        help="Narrate to stderr. -v = INFO, -vv = DEBUG. Default is silent.",
+    )
     sub = p.add_subparsers(dest="command", required=True)
 
     p_init = sub.add_parser("init", help="Create config, dirs, and db.")
@@ -448,6 +493,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    _setup_logging(args.verbose)
     return args.func(args)
 
 

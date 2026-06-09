@@ -131,6 +131,7 @@ Where a single PR dominates a cluster, mention it by number in the
 rec body so the user can grep their PR backlog. Don't fabricate PR
 numbers — only use what the digest surfaces.
 
+{tool_meta_section}
 # Output
 
 Your final output must be **only** a JSON array — no prose around it, no

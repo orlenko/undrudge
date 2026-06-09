@@ -17,6 +17,7 @@ substitute a pure-Python mock without touching subprocess.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 import subprocess
@@ -31,7 +32,10 @@ from . import config as cfg_mod
 from . import digest as digest_mod
 from . import events, llm, recommend
 
+logger = logging.getLogger(__name__)
+
 PROMPT_TEMPLATE = "analyze.md"
+TOOL_META_TEMPLATE = "tool_meta.md"
 DEFAULT_TIMEOUT = 600  # claude -p with a chunky prompt routinely needs minutes
 
 
@@ -58,9 +62,24 @@ def load_prompt_template() -> str:
     return (files("undrudge") / "prompts" / PROMPT_TEMPLATE).read_text()
 
 
-def build_prompt(digest_md: str, recent_recs_md: str) -> str:
+def load_tool_meta_section() -> str:
+    return (files("undrudge") / "prompts" / TOOL_META_TEMPLATE).read_text()
+
+
+def build_prompt(
+    digest_md: str, recent_recs_md: str, *, scope: str = "daily"
+) -> str:
     tpl = load_prompt_template()
-    return tpl.replace("{digest}", digest_md).replace("{recent_recs}", recent_recs_md)
+    # Tool meta-analysis is a weekly-only pass: per-pattern friction
+    # dominates daily runs, and re-asking "should you use rg?" every
+    # day produces noise the dedupe layer would have to absorb anyway.
+    meta = load_tool_meta_section() if scope == "weekly" else ""
+    return (
+        tpl
+        .replace("{digest}", digest_md)
+        .replace("{recent_recs}", recent_recs_md)
+        .replace("{tool_meta_section}", meta)
+    )
 
 
 # --------------------------------------------------------------------------
@@ -127,11 +146,22 @@ class FileBasedInvoker:
                 stderr=err_fp,
                 cwd=self.workdir,
             )
+            started = time.time()
+            logger.info(
+                "spawned claude pid=%d argv=%s prompt=%d chars timeout=%ds",
+                proc.pid, self.command_argv, len(prompt), self.timeout,
+            )
 
-            deadline = time.time() + self.timeout
+            deadline = started + self.timeout
+            last_log = started
             try:
                 while time.time() < deadline:
                     if marker_file.exists():
+                        elapsed = time.time() - started
+                        logger.info(
+                            "claude pid=%d wrote marker after %.1fs",
+                            proc.pid, elapsed,
+                        )
                         try:
                             proc.wait(timeout=10)
                         except subprocess.TimeoutExpired:
@@ -151,6 +181,17 @@ class FileBasedInvoker:
                             f"--- stderr tail ---\n{tail}\n"
                             f"workdir: {self.workdir}"
                         )
+                    now = time.time()
+                    if now - last_log >= 30:
+                        logger.info(
+                            "claude pid=%d still running (%.0fs elapsed, %.0fs remaining)",
+                            proc.pid, now - started, deadline - now,
+                        )
+                        last_log = now
+                    logger.debug(
+                        "poll pid=%d elapsed=%.1fs marker=%s",
+                        proc.pid, time.time() - started, marker_file.exists(),
+                    )
                     time.sleep(self.poll_interval)
             finally:
                 if proc.poll() is None:
@@ -341,19 +382,30 @@ def run(
     writes per-rec markdown to the workdir, but does not insert DB rows or
     fire the on_write hook.
     """
+    logger.info(
+        "analyze start: scope=%s window=%dh dry_run=%s",
+        scope, window_hours, dry_run,
+    )
     digest_md = digest_mod.render_daily(
         conn, end_ts_ms=end_ts_ms, window_hours=window_hours
     )
     recent = recommend.recent_logged(conn)
     recent_md = recommend.render_recent_for_prompt(recent)
-    prompt = build_prompt(digest_md, recent_md)
+    prompt = build_prompt(digest_md, recent_md, scope=scope)
+    logger.info(
+        "prompt assembled: digest=%d chars, recent_recs=%d chars, prompt=%d chars",
+        len(digest_md), len(recent_md), len(prompt),
+    )
 
     workdir = workdir or _new_run_workdir(cfg, suffix="dry" if dry_run else "")
     workdir.mkdir(parents=True, exist_ok=True)
     (workdir / "prompt.md").write_text(prompt)
+    logger.info("workdir: %s", workdir)
 
     if invoker is None:
-        argv = [str(llm.resolve_command(cfg.llm.command))]
+        resolved = llm.resolve_command(cfg.llm.command)
+        logger.info("llm.command resolved: %s -> %s", cfg.llm.command, resolved)
+        argv = [str(resolved)]
         invoker = FileBasedInvoker(
             command_argv=argv,
             workdir=workdir,
@@ -367,10 +419,15 @@ def run(
         # Persist whatever response we got — even on failure — so the user
         # can `cat <workdir>/response.txt` and see what happened.
         (workdir / "response.txt").write_text(response or "")
+    logger.info("llm response: %d chars", len(response))
 
     try:
         items = extract_json_array(response)
     except ValueError as first_err:
+        logger.warning(
+            "first parse failed (%s) — sending repair prompt to claude",
+            first_err,
+        )
         # Repair attempt: hand the bad output back to claude with a
         # tight "this isn't valid JSON, fix it" prompt. One retry only;
         # if the second attempt fails, surface the original error.
@@ -382,15 +439,23 @@ def run(
         (workdir / "response.txt").write_text(repair_response or "")
         try:
             items = extract_json_array(repair_response)
+            logger.info("repair succeeded; recovered %d items", len(items))
         except ValueError:
+            logger.warning("repair also failed — surfacing original error")
             raise first_err from None
     recs = to_recommendations(items, scope=scope)
+    logger.info("parsed %d items -> %d valid recommendations", len(items), len(recs))
 
     refs_resolved, refs_total = 0, 0
     for rec in recs:
         r, t = recommend.resolve_evidence_refs(conn, rec.evidence_refs)
         refs_resolved += r
         refs_total += t
+    if refs_total:
+        logger.info(
+            "evidence refs resolved: %d/%d (%d%%)",
+            refs_resolved, refs_total, 100 * refs_resolved // refs_total,
+        )
 
     if dry_run:
         written: list[recommend.WriteResult] = []
@@ -423,6 +488,10 @@ def run(
             conn, rec, recs_dir=cfg.paths.recs_dir, on_write=on_write
         )
         if result.inserted:
+            logger.info(
+                "wrote rec %s: %s",
+                result.fingerprint[:12], rec.title[:60],
+            )
             written.append(result)
             events.record(
                 cfg.paths.events_log,
@@ -441,6 +510,14 @@ def run(
             )
         else:
             skipped += 1
+            logger.info(
+                "skipped rec %s (dup): %s",
+                result.fingerprint[:12], rec.title[:60],
+            )
+    logger.info(
+        "analyze done: parsed=%d written=%d skipped=%d",
+        len(recs), len(written), skipped,
+    )
     events.record(
         cfg.paths.events_log,
         "analyze_complete",

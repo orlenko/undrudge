@@ -32,6 +32,23 @@ def test_build_prompt_substitutes_in_order():
     assert "RECS_BODY" in prompt
     assert "{digest}" not in prompt
     assert "{recent_recs}" not in prompt
+    # Placeholder must always be substituted, even when empty.
+    assert "{tool_meta_section}" not in prompt
+
+
+def test_build_prompt_omits_tool_meta_on_daily():
+    prompt = analyze.build_prompt("D", "R", scope="daily")
+    assert "Tool meta-analysis" not in prompt
+    assert "ripgrep" not in prompt.lower()
+
+
+def test_build_prompt_includes_tool_meta_on_weekly():
+    prompt = analyze.build_prompt("D", "R", scope="weekly")
+    assert "Tool meta-analysis" in prompt
+    # Spot-check a few signals the section is supposed to teach.
+    assert "rg" in prompt
+    assert "fd" in prompt
+    assert "agent_global" in prompt
 
 
 # --------------------------------------------------------------------------

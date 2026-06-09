@@ -14,6 +14,7 @@ deduplicate cleanly on re-run.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ from pathlib import Path
 from typing import Any
 
 from . import sanitize, store
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -296,8 +299,10 @@ def ingest(
     """
     stats = ClaudeIngestStats()
     if not projects_root.exists():
+        logger.info("claude projects root missing: %s — skipping", projects_root)
         return stats
 
+    logger.info("scanning claude projects under %s", projects_root)
     sessions: dict[str, _SessionState] = {}
 
     for jsonl_path in sorted(projects_root.rglob("*.jsonl")):
@@ -308,17 +313,29 @@ def ingest(
 
         try:
             file_size = jsonl_path.stat().st_size
-        except OSError:
+        except OSError as e:
+            logger.debug("stat failed for %s: %s — skipping", jsonl_path, e)
             stats.files_skipped += 1
             continue
 
         if file_size < offset:
             # Truncation/rotation: reset and re-ingest from the start.
+            logger.debug(
+                "%s: file shrank (size=%d < cursor=%d), re-ingesting from 0",
+                jsonl_path, file_size, offset,
+            )
             offset = 0
 
         if file_size == offset:
+            logger.debug("%s: no new bytes (offset=%d)", jsonl_path, offset)
             continue
 
+        logger.debug(
+            "%s: reading bytes [%d:%d] (+%d)",
+            jsonl_path, offset, file_size, file_size - offset,
+        )
+        lines_before = stats.lines_read
+        inserted_before = stats.rows_inserted
         try:
             with jsonl_path.open("rb") as f:
                 f.seek(offset)
@@ -327,7 +344,8 @@ def ingest(
                     text = raw.decode("utf-8", errors="replace")
                     _ingest_line(conn, text, sessions, stats, fail_loud=fail_loud)
                 final = f.tell()
-        except OSError:
+        except OSError as e:
+            logger.debug("read failed for %s: %s — skipping", jsonl_path, e)
             stats.files_skipped += 1
             continue
 
@@ -337,8 +355,21 @@ def ingest(
 
         _write_cursor(conn, source, {"offset": final})
         stats.bytes_consumed += final - offset
+        logger.info(
+            "%s: +%d lines, +%d rows, cursor=%d",
+            jsonl_path.name,
+            stats.lines_read - lines_before,
+            stats.rows_inserted - inserted_before,
+            final,
+        )
 
     stats.sessions_touched = conn.execute(
         "SELECT COUNT(*) FROM sessions"
     ).fetchone()[0]
+    logger.info(
+        "claude ingest done: files=%d (skipped=%d) lines=%d rows=%d sessions=%d redaction_drops=%d",
+        stats.files_seen, stats.files_skipped,
+        stats.lines_read, stats.rows_inserted,
+        stats.sessions_touched, stats.redaction_drops,
+    )
     return stats
