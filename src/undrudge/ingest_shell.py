@@ -1,12 +1,23 @@
 """Ingest atuin shell history.
 
-atuin's ``history.db`` is the source of truth. We open it read-only via the
-SQLite URI flag — atuin uses WAL and the filesystem permissions usually keep
-it user-only, but we never write either way.
+atuin's ``history.db`` is the source of truth. atuin runs a long-lived
+daemon that holds the db in WAL mode and writes continuously (shell
+hooks stream every command in real time). A direct read-only open
+against the live file intermittently fails at first SELECT with
+``OperationalError: unable to open database file`` — the race is in
+SQLite's WAL-index/-shm handshake, not in the file itself.
 
-Cursor: max ``timestamp`` (nanoseconds since epoch) processed so far. The
-``UNIQUE(source, external_id)`` constraint on ``commands`` makes re-ingest
-trivially safe — duplicates collapse via ``INSERT OR IGNORE``.
+To avoid the race entirely we snapshot the db + WAL + SHM into a
+private temp dir with ``shutil.copy2`` (byte-level reads, no SQLite
+locks) and read from the copy. ~57MB of I/O per hourly gather is well
+worth never debugging WAL races again.
+
+Cursor: max ``timestamp`` (nanoseconds since epoch) processed so far.
+``_write_cursor`` only fires after a successful ingest, so a snapshot
+or read failure leaves the cursor untouched and the next gather picks
+up the same window — no rows are lost. The ``UNIQUE(source,
+external_id)`` constraint on ``commands`` makes re-ingest trivially
+safe — duplicates collapse via ``INSERT OR IGNORE``.
 """
 
 from __future__ import annotations
@@ -14,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,12 +36,11 @@ logger = logging.getLogger(__name__)
 
 ATUIN_SOURCE = "atuin"
 
-# Atuin's daemon holds history.db and uses WAL; sporadic
-# `OperationalError: unable to open database file` shows up around
-# checkpoints and macOS DarkWake transitions when launchd fires gather
-# during a not-fully-awake window. Retry-with-backoff swallows both.
-_OPEN_ATTEMPTS = 3
-_OPEN_BACKOFF_SECONDS = 1.0
+# Backup-API snapshots cooperate with the WAL writer at the page level,
+# but very heavy load can still surface SQLITE_BUSY or transient errors.
+# Three attempts with a small backoff is plenty for an hourly job.
+_SNAPSHOT_ATTEMPTS = 3
+_SNAPSHOT_BACKOFF_SECONDS = 0.5
 
 
 @dataclass
@@ -81,7 +92,7 @@ def ingest(
         "reading atuin from %s (cursor=%d ns)",
         atuin_db_path, cursor_ns,
     )
-    rows = _read_atuin_rows_with_retry(atuin_db_path, cursor_ns)
+    rows = _read_atuin_rows_via_snapshot(atuin_db_path, cursor_ns)
     logger.debug("atuin returned %d candidate rows", len(rows))
 
     max_ts_ns = cursor_ns
@@ -152,48 +163,101 @@ def ingest(
     return stats
 
 
-def _read_atuin_rows_with_retry(
+def _read_atuin_rows_via_snapshot(
     atuin_db_path: Path, cursor_ns: int
 ) -> list[sqlite3.Row]:
-    """Open atuin's history.db read-only and pull rows newer than cursor_ns.
+    """Snapshot atuin's db via SQLite's backup API, then read from the copy.
 
-    Retries a small number of times on ``OperationalError`` so transient
-    "unable to open database file" failures (atuin daemon mid-checkpoint,
-    DarkWake fs hand-off) don't surface as a noisy gather traceback.
+    Two failure modes that had to be designed around at once:
+
+    1. **Production WAL handshake race.** Plain ``file:...?mode=ro``
+       against the live db racks up intermittent
+       ``OperationalError: unable to open database file`` at first
+       SELECT — SQLite needs to consult ``-shm`` and the WAL index,
+       which races atuin's always-active writer.
+
+    2. **Torn-page byte-copy.** Naively ``shutil.copy2``-ing the main db
+       (or main + ``-wal`` + ``-shm``) while the writer is checkpointing
+       can produce an internally inconsistent file
+       (``DatabaseError: database disk image is malformed``).
+
+    The fix: open the source read-only, use SQLite's online backup API
+    (``Connection.backup``) to snapshot into a temp dir, then read from
+    the snapshot with ``immutable=1``.
+
+    Why this works:
+
+    - The backup API is the canonical way to copy a live SQLite db.
+      It iterates pages under brief shared locks and cooperates with
+      concurrent writers — no torn pages.
+    - We open the source with ``mode=ro``, so we still promise never
+      to mutate or lock atuin's live file in any user-observable way.
+    - The destination snapshot is in our private tempdir and opened
+      with ``immutable=1`` for reads, which skips WAL/shm logic
+      entirely on the read side. No race possible against a writer
+      that doesn't exist for the copy.
+    - A small retry loop handles transient ``SQLITE_BUSY`` /
+      ``unable to open database file`` from the source under
+      pathological load.
+
+    Cursor safety: this function either returns rows or raises. The
+    caller does not advance the cursor on exceptions, so a snapshot
+    failure simply defers those rows to the next gather run — no
+    history is lost.
     """
-    last_exc: sqlite3.OperationalError | None = None
-    for attempt in range(_OPEN_ATTEMPTS):
+    last_exc: BaseException | None = None
+    for attempt in range(_SNAPSHOT_ATTEMPTS):
         try:
-            uri = f"file:{atuin_db_path}?mode=ro"
-            src = sqlite3.connect(uri, uri=True)
-            src.row_factory = sqlite3.Row
-            try:
-                cols = {row[1] for row in src.execute("PRAGMA table_info(history)")}
-                select_cols = (
-                    "id, timestamp, duration, exit, command, cwd, session, hostname"
-                )
-                if "author" in cols:
-                    select_cols += ", author"
-                if "intent" in cols:
-                    select_cols += ", intent"
-                return src.execute(
-                    f"""SELECT {select_cols}
-                         FROM history
-                        WHERE deleted_at IS NULL
-                          AND timestamp > ?
-                        ORDER BY timestamp ASC""",
-                    (cursor_ns,),
-                ).fetchall()
-            finally:
-                src.close()
-        except sqlite3.OperationalError as e:
+            return _snapshot_and_read_once(atuin_db_path, cursor_ns)
+        except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
             last_exc = e
-            if attempt < _OPEN_ATTEMPTS - 1:
-                delay = _OPEN_BACKOFF_SECONDS * (2 ** attempt)
+            if attempt < _SNAPSHOT_ATTEMPTS - 1:
+                delay = _SNAPSHOT_BACKOFF_SECONDS * (2 ** attempt)
                 logger.warning(
-                    "atuin open failed (%s); retry %d/%d in %.0fs",
-                    e, attempt + 1, _OPEN_ATTEMPTS - 1, delay,
+                    "atuin snapshot attempt %d/%d failed (%s); retry in %.1fs",
+                    attempt + 1, _SNAPSHOT_ATTEMPTS, e, delay,
                 )
                 time.sleep(delay)
     assert last_exc is not None
     raise last_exc
+
+
+def _snapshot_and_read_once(
+    atuin_db_path: Path, cursor_ns: int
+) -> list[sqlite3.Row]:
+    with tempfile.TemporaryDirectory(prefix="undrudge-atuin-") as tmp:
+        snapshot_path = Path(tmp) / "history-snapshot.db"
+
+        src = sqlite3.connect(f"file:{atuin_db_path}?mode=ro", uri=True)
+        try:
+            dst = sqlite3.connect(snapshot_path)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+
+        reader = sqlite3.connect(
+            f"file:{snapshot_path}?mode=ro&immutable=1", uri=True
+        )
+        reader.row_factory = sqlite3.Row
+        try:
+            cols = {row[1] for row in reader.execute("PRAGMA table_info(history)")}
+            select_cols = (
+                "id, timestamp, duration, exit, command, cwd, session, hostname"
+            )
+            if "author" in cols:
+                select_cols += ", author"
+            if "intent" in cols:
+                select_cols += ", intent"
+            return reader.execute(
+                f"""SELECT {select_cols}
+                     FROM history
+                    WHERE deleted_at IS NULL
+                      AND timestamp > ?
+                    ORDER BY timestamp ASC""",
+                (cursor_ns,),
+            ).fetchall()
+        finally:
+            reader.close()

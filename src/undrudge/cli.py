@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import shutil
 import sqlite3
@@ -137,7 +138,59 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
         except sqlite3.DatabaseError as e:
             check("db opens", False, str(e))
 
+    print("\ngather:")
+    _check_gather_health(cfg, check)
+
     return 0 if ok else 1
+
+
+def _check_gather_health(cfg: "config.Config", check) -> None:
+    """Surface recent gather failures from events.jsonl.
+
+    Silent hourly failure is how the atuin WAL race went unnoticed for
+    weeks. Doctor now scans events.jsonl for ``gather_failed`` events
+    in the last 24h and flags any it finds, with the most recent
+    error_type so the operator can grep.
+    """
+    log = cfg.paths.events_log
+    if not log.exists():
+        check("events log present", False,
+              f"{log} not created yet — gather has not run")
+        return
+
+    cutoff_ms = store.now_ms() - 24 * 3600 * 1000
+    recent: list[dict] = []
+    try:
+        with log.open(encoding="utf-8") as fp:
+            for line in fp:
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    e.get("event") == "gather_failed"
+                    and e.get("ts", 0) >= cutoff_ms
+                ):
+                    recent.append(e)
+    except OSError as e:
+        check("events log readable", False, str(e))
+        return
+
+    if not recent:
+        check("no gather failures in last 24h", True, str(log))
+        return
+
+    by_source: dict[str, int] = {}
+    for e in recent:
+        by_source[e.get("source", "?")] = by_source.get(e.get("source", "?"), 0) + 1
+    last = recent[-1]
+    breakdown = ", ".join(f"{s}={n}" for s, n in sorted(by_source.items()))
+    detail = (
+        f"{len(recent)} failure(s) ({breakdown}); "
+        f"last: {last.get('source')} {last.get('error_type')}: "
+        f"{(last.get('error_msg') or '')[:120]}"
+    )
+    check("no gather failures in last 24h", False, detail)
 
 
 def _placeholder(name: str):
@@ -371,35 +424,70 @@ def _cmd_digest(args: argparse.Namespace) -> int:
 
 
 def _cmd_gather(_args: argparse.Namespace) -> int:
+    """Ingest claude + shell activity. Each source runs independently; one
+    failing doesn't block the other. Failures are recorded as
+    ``gather_failed`` events in events.jsonl so ``undrudge doctor`` can
+    surface them — silent hourly failure is what let the WAL bug fester
+    for weeks.
+    """
     cfg = config.load()
     conn = store.open_db(cfg.paths.db)
+    c: ingest_claude.ClaudeIngestStats | None = None
+    s: ingest_shell.ShellIngestStats | None = None
+    failures: list[tuple[str, BaseException]] = []
+    gather_logger = logging.getLogger("undrudge.gather")
     try:
         store.apply_schema(conn)
-        c = ingest_claude.ingest(
-            conn, cfg.claude.projects_root, fail_loud=cfg.privacy.fail_loud
-        )
-        s = ingest_shell.ingest(
-            conn, cfg.atuin.db, fail_loud=cfg.privacy.fail_loud
-        )
+        try:
+            c = ingest_claude.ingest(
+                conn, cfg.claude.projects_root, fail_loud=cfg.privacy.fail_loud
+            )
+        except Exception as e:
+            failures.append(("claude", e))
+            gather_logger.exception("claude ingest failed")
+        try:
+            s = ingest_shell.ingest(
+                conn, cfg.atuin.db, fail_loud=cfg.privacy.fail_loud
+            )
+        except Exception as e:
+            failures.append(("shell", e))
+            gather_logger.exception("shell ingest failed")
     finally:
         conn.close()
 
-    print("claude:")
-    print(f"  files seen          : {c.files_seen}")
-    print(f"  files skipped       : {c.files_skipped}")
-    print(f"  lines read          : {c.lines_read}")
-    print(f"  lines skipped       : {c.lines_skipped}")
-    print(f"  rows inserted       : {c.rows_inserted}")
-    print(f"  sessions tracked    : {c.sessions_touched}")
-    print(f"  bytes consumed      : {c.bytes_consumed}")
-    print(f"  redaction drops     : {c.redaction_drops}")
-    print()
-    print("shell (atuin):")
-    print(f"  rows seen           : {s.rows_seen}")
-    print(f"  rows inserted       : {s.rows_inserted}")
-    print(f"  rows dropped        : {s.rows_dropped}")
-    print(f"  last ts (ns)        : {s.last_ts_ns}")
-    return 0
+    if c is not None:
+        print("claude:")
+        print(f"  files seen          : {c.files_seen}")
+        print(f"  files skipped       : {c.files_skipped}")
+        print(f"  lines read          : {c.lines_read}")
+        print(f"  lines skipped       : {c.lines_skipped}")
+        print(f"  rows inserted       : {c.rows_inserted}")
+        print(f"  sessions tracked    : {c.sessions_touched}")
+        print(f"  bytes consumed      : {c.bytes_consumed}")
+        print(f"  redaction drops     : {c.redaction_drops}")
+        print()
+    if s is not None:
+        print("shell (atuin):")
+        print(f"  rows seen           : {s.rows_seen}")
+        print(f"  rows inserted       : {s.rows_inserted}")
+        print(f"  rows dropped        : {s.rows_dropped}")
+        print(f"  last ts (ns)        : {s.last_ts_ns}")
+
+    for source, exc in failures:
+        print(
+            f"\nFAILED: {source} ingest — {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        events.record(
+            cfg.paths.events_log,
+            "gather_failed",
+            {
+                "source": source,
+                "error_type": type(exc).__name__,
+                "error_msg": str(exc),
+            },
+        )
+    return 1 if failures else 0
 
 
 def _build_parser() -> argparse.ArgumentParser:

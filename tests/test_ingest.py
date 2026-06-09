@@ -190,20 +190,60 @@ def test_shell_ingest_idempotent(db, atuin_db: Path):
     assert second.rows_inserted == 0
 
 
-def test_shell_ingest_retries_transient_open_errors(
+def test_shell_ingest_does_not_touch_source_db(db, atuin_db: Path):
+    """The live atuin db must not be opened, locked, or modified —
+    snapshot path reads only from the temp copy.
+    """
+    before = atuin_db.stat()
+    ingest_shell.ingest(db, atuin_db)
+    after = atuin_db.stat()
+    assert before.st_mtime_ns == after.st_mtime_ns
+    assert before.st_size == after.st_size
+    # Neither -wal nor -shm should appear in the source dir from our read
+    # (the fixture isn't in WAL mode, so they shouldn't exist either way).
+    assert not atuin_db.with_name(atuin_db.name + "-wal").exists()
+    assert not atuin_db.with_name(atuin_db.name + "-shm").exists()
+
+
+def test_shell_ingest_propagates_persistent_snapshot_failure(
     db, atuin_db: Path, monkeypatch
 ):
-    """Two transient OperationalErrors then success → ingest still works."""
-    real_connect = sqlite3.connect
+    """If the snapshot keeps failing past the retry budget, the error
+    surfaces to the caller (the gather CLI records the gather_failed
+    event from there). Cursor must not advance.
+    """
+    def always_fail(*args, **kwargs):
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(ingest_shell, "_snapshot_and_read_once", always_fail)
+    monkeypatch.setattr(ingest_shell.time, "sleep", lambda _s: None)
+
+    with pytest.raises(sqlite3.OperationalError, match="unable to open"):
+        ingest_shell.ingest(db, atuin_db)
+
+    cur = db.execute(
+        "SELECT position FROM cursors WHERE source = 'atuin'"
+    ).fetchone()
+    assert cur is None or json.loads(cur["position"]).get("max_ts_ns", 0) == 0
+
+
+def test_shell_ingest_retries_transient_snapshot_failure(
+    db, atuin_db: Path, monkeypatch
+):
+    """Two transient failures then success → ingest still works.
+    The retry loop exists for SQLITE_BUSY storms; verify it actually
+    retries instead of bailing on the first error.
+    """
+    real_snapshot = ingest_shell._snapshot_and_read_once
     calls = {"n": 0}
 
-    def flaky_connect(*args, **kwargs):
+    def flaky(*args, **kwargs):
         calls["n"] += 1
         if calls["n"] <= 2:
             raise sqlite3.OperationalError("unable to open database file")
-        return real_connect(*args, **kwargs)
+        return real_snapshot(*args, **kwargs)
 
-    monkeypatch.setattr(ingest_shell.sqlite3, "connect", flaky_connect)
+    monkeypatch.setattr(ingest_shell, "_snapshot_and_read_once", flaky)
     monkeypatch.setattr(ingest_shell.time, "sleep", lambda _s: None)
 
     stats = ingest_shell.ingest(db, atuin_db)
@@ -211,18 +251,93 @@ def test_shell_ingest_retries_transient_open_errors(
     assert stats.rows_inserted == 3
 
 
-def test_shell_ingest_propagates_persistent_open_failure(
-    db, atuin_db: Path, monkeypatch
-):
-    """Every attempt fails → the OperationalError surfaces to the caller."""
-    def always_fail(*args, **kwargs):
-        raise sqlite3.OperationalError("unable to open database file")
+def test_shell_ingest_under_wal_concurrent_writer(db, tmp_path: Path):
+    """A separate thread writes to a WAL-mode db while we ingest in a
+    tight loop. The snapshot path must complete every run cleanly —
+    no OperationalError, no rows lost, source file unmolested.
+    """
+    import threading
 
-    monkeypatch.setattr(ingest_shell.sqlite3, "connect", always_fail)
-    monkeypatch.setattr(ingest_shell.time, "sleep", lambda _s: None)
+    atuin_path = tmp_path / "atuin.db"
+    src = sqlite3.connect(atuin_path)
+    src.execute("PRAGMA journal_mode=WAL")
+    src.executescript(
+        """
+        CREATE TABLE history (
+          id TEXT PRIMARY KEY, timestamp INTEGER, duration INTEGER, exit INTEGER,
+          command TEXT, cwd TEXT, session TEXT, hostname TEXT,
+          deleted_at INTEGER, author TEXT, intent TEXT
+        );
+        """
+    )
+    src.commit()
+    src.close()
 
-    with pytest.raises(sqlite3.OperationalError):
-        ingest_shell.ingest(db, atuin_db)
+    stop = threading.Event()
+    writes_done = {"n": 0}
+    writer_errors: list[str] = []
+
+    def writer() -> None:
+        # Throttled writer: realistic atuin pace is bursts of commits,
+        # not a pure busy loop. A pure busy loop can prevent SQLite's
+        # backup API from ever converging — the source keeps changing
+        # while pages are being copied. The 2ms sleep gives backup
+        # forward progress without removing the concurrency stress.
+        w = sqlite3.connect(atuin_path, timeout=5.0)
+        try:
+            while not stop.is_set():
+                i = writes_done["n"]
+                ts_ns = 1_700_000_000_000_000_000 + i * 1_000_000
+                try:
+                    w.execute(
+                        "INSERT OR IGNORE INTO history VALUES "
+                        "(?,?,?,?,?,?,?,?,?,?,?)",
+                        (f"w{i:08d}", ts_ns, 1000, 0, f"cmd {i}",
+                         "/tmp", "s", "host:user", None, "", None),
+                    )
+                    w.commit()
+                    writes_done["n"] += 1
+                except sqlite3.OperationalError as e:
+                    writer_errors.append(str(e))
+                stop.wait(0.002)
+        finally:
+            w.close()
+
+    t = threading.Thread(target=writer, daemon=True)
+    t.start()
+    try:
+        ingest_errors: list[BaseException] = []
+        for _ in range(5):
+            try:
+                ingest_shell.ingest(db, atuin_path)
+            except sqlite3.OperationalError as e:
+                ingest_errors.append(e)
+    finally:
+        stop.set()
+        t.join(timeout=5)
+
+    assert ingest_errors == [], (
+        f"snapshot reader raised under concurrent WAL writer: "
+        f"{[str(e) for e in ingest_errors]}"
+    )
+    assert writes_done["n"] > 0
+
+    # Force a WAL checkpoint so the rows the writer committed land in
+    # the main db file. With immutable=1 the snapshot only sees
+    # checkpointed data; without this final checkpoint the snapshot can
+    # legitimately be empty (the freshness-gap trade-off we accepted),
+    # which would mask whether the reader actually works.
+    ck = sqlite3.connect(atuin_path)
+    try:
+        ck.execute("PRAGMA wal_checkpoint(FULL)")
+    finally:
+        ck.close()
+    ingest_shell.ingest(db, atuin_path)
+
+    seen = db.execute(
+        "SELECT COUNT(*) FROM commands WHERE source = 'atuin'"
+    ).fetchone()[0]
+    assert seen > 0
 
 
 def test_shell_ingest_resumes_after_new_rows(db, atuin_db: Path):

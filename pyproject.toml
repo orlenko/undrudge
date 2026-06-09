@@ -35,11 +35,19 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/undrudge"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"src/undrudge/schema.sql" = "undrudge/schema.sql"
-"src/undrudge/prompts" = "undrudge/prompts"
-"src/undrudge/scripts" = "undrudge/scripts"
+# Ship the non-Python data files (prompts/*.md, schema.sql, scripts/*.sh)
+# alongside the package. hatchling's `packages` directive already pulls
+# every file under src/undrudge into the wheel, so an explicit
+# force-include of those same paths double-adds them — newer hatchling
+# rejects the duplicate with "A second file is being added to the wheel
+# archive at the same path". `artifacts` ensures the data files are
+# included even if a future .gitignore / VCS rule would exclude them,
+# without re-adding paths `packages` already covers.
+artifacts = [
+  "src/undrudge/schema.sql",
+  "src/undrudge/prompts/*.md",
+  "src/undrudge/scripts/*",
+]
 
 [dependency-groups]
 dev = [
