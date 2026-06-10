@@ -1,0 +1,1110 @@
+#!/usr/bin/env python3
+"""undrudge-dispatch — deterministic morning courier for undrudge recommendations.
+
+Selects logged recs from the undrudge sqlite (read-only), filters them
+(deny-list, similarity vs prior dismissals), routes them to pinned repo clones,
+writes self-contained briefs into <clone>/.undrudge-inbox/, stages cmux
+workspaces with a pre-typed launch command, reconciles draft-PR outcomes and
+session verdicts back into undrudge statuses, and writes a morning report +
+approval queue into the Obsidian vault.
+
+Zero LLM calls — interactive Claude sessions (via the global /undrudge-check
+command) do the thinking; this script only moves paper. Status flips go through
+the undrudge CLI only, so the sqlite + frontmatter + events.jsonl stay coherent.
+
+Subcommands:  run [--dry-run] [-v]   (default)
+              status
+Design note: vault topics/2026-06-09-automation-dispatch-brainstorm.md
+"""
+
+import datetime
+import difflib
+import fcntl
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+import traceback
+
+CONFIG_PATH = os.path.expanduser("~/.config/undrudge-dispatch/config.json")
+NEEDS_HUMAN = ("needs-human", "convert-to-task")
+DISMISS_CLASS = ("dismiss-stale", "reject-as-framed", "dismiss")
+
+LOG_LINES = []
+
+
+def log(msg):
+    line = "%s %s" % (datetime.datetime.now().strftime("%H:%M:%S"), msg)
+    LOG_LINES.append(line)
+    print(line, file=sys.stderr)
+
+
+def run_cmd(argv, timeout=30, cwd=None, extra_env=None):
+    """Run a command; return (rc, stdout, stderr). Never raises."""
+    env = dict(os.environ)
+    if extra_env:
+        env.update(extra_env)
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True,
+                           timeout=timeout, cwd=cwd, env=env)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout after %ss: %s" % (timeout, " ".join(argv))
+    except Exception as e:  # missing binary etc.
+        return 127, "", "%s: %s" % (type(e).__name__, e)
+
+
+GIT_ENV = {"GIT_TERMINAL_PROMPT": "0"}
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def canonical_sig(sig):
+    s = (sig or "").lower()
+    s = re.sub(r"[`'\"]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def parse_frontmatter(body_path):
+    """Extract the leading ```json fence from a rec markdown file."""
+    try:
+        text = open(body_path, encoding="utf-8").read()
+    except Exception:
+        return {}, ""
+    m = re.search(r"^```json\s*\n(.*?)\n```", text, re.S | re.M)
+    if not m:
+        return {}, text
+    try:
+        return json.loads(m.group(1)), text
+    except Exception:
+        return {}, text
+
+
+def normalize_origin(url):
+    u = (url or "").strip().lower()
+    u = re.sub(r"^(https?://|ssh://)", "", u)
+    if u.startswith("git@"):
+        u = u[4:].replace(":", "/", 1)
+    u = re.sub(r"^[^/@]+@", "", u)
+    u = re.sub(r"\.git$", "", u)
+    u = re.sub(r"/+", "/", u)
+    return u
+
+
+def path_under(cwd, prefix):
+    return cwd == prefix or cwd.startswith(prefix.rstrip("/") + "/")
+
+
+def age_days(ts_epoch):
+    return (time.time() - ts_epoch) / 86400.0
+
+
+def tail_lines(path, n=200, max_bytes=64 * 1024):
+    """Last n lines of a file without reading it whole."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - max_bytes))
+            data = f.read().decode("utf-8", "replace")
+        return data.splitlines()[-n:]
+    except Exception:
+        return []
+
+
+def trim_log(path, keep=500 * 1024, threshold=2 * 1024 * 1024):
+    try:
+        if os.path.getsize(path) > threshold:
+            with open(path, "rb") as f:
+                f.seek(-keep, 2)
+                data = f.read()
+            with open(path, "wb") as f:
+                f.write(b"[trimmed]\n" + data)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- core class
+
+class Dispatcher(object):
+    def __init__(self, cfg, dry=False):
+        self.cfg = cfg
+        self.dry = dry
+        # routes without an explicit dir get a dedicated managed clone under
+        # clones_dir — triage must never collide with a working checkout
+        for route in cfg["routes"]:
+            if not route.get("dir"):
+                route["dir"] = os.path.join(cfg.get("clones_dir", ""), route["name"])
+                route["_managed_clone"] = True
+                if route.get("sync") is None:
+                    route["sync"] = ["fetch", "switch:%s" % route.get("branch", "main"), "pull"]
+        self.state_dir = cfg["state_dir"]
+        self.ledger_path = os.path.join(self.state_dir, "ledger.jsonl")
+        self.state_path = os.path.join(self.state_dir, "state.json")
+        self.spool_dir = os.path.join(self.state_dir, "verdicts")
+        self.vault = cfg["vault_dir"]
+        self.queue_path = os.path.join(self.vault, "undrudge", "dispatch-queue.md")
+        self.log_dir = os.path.join(self.vault, "undrudge", "dispatch-log")
+        self.today = datetime.date.today().isoformat()
+        self.now_hm = datetime.datetime.now().strftime("%H:%M")
+        self.flips = 0
+        self.flipped_ids = set()       # id12s this run changed via the CLI
+        self.verdict_holds = {}        # id12 -> (disposition, reason)
+        self.report = {
+            "dispatched": [], "held": [], "would_dismiss": [], "auto_dismissed": [],
+            "completed": [], "pending_prs": [], "approvals": [], "verdicts": [],
+            "failures": [], "health": [], "notes": [],
+        }
+        os.makedirs(self.state_dir, exist_ok=True)
+        os.makedirs(os.path.join(self.state_dir, "logs"), exist_ok=True)
+        os.makedirs(self.spool_dir, exist_ok=True)
+        self.ledger = self._load_ledger()
+        self.state = load_json(self.state_path, None)
+        if self.state is None:
+            if os.path.exists(self.state_path):
+                self.report["failures"].append("state.json unreadable — treating as first run")
+            self.state = {}
+
+    # -------------------------------------------------- ledger / state
+
+    def _load_ledger(self):
+        entries = {}
+        if os.path.exists(self.ledger_path):
+            for line in open(self.ledger_path, encoding="utf-8"):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                    entries.setdefault(e.get("rec_id", "?"), []).append(e)
+                except Exception:
+                    continue
+        return entries
+
+    def ledger_append(self, rec_id, action, **kw):
+        e = dict(ts=datetime.datetime.now().isoformat(timespec="seconds"),
+                 rec_id=rec_id, action=action, **kw)
+        self.ledger.setdefault(rec_id, []).append(e)
+        if not self.dry:
+            with open(self.ledger_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(e) + "\n")
+
+    def has_action(self, rec_id, *actions):
+        return any(e.get("action") in actions for e in self.ledger.get(rec_id, []))
+
+    def last_verdict(self, rec_id):
+        for e in reversed(self.ledger.get(rec_id, [])):
+            if e.get("action") == "verdict":
+                return e
+        return None
+
+    def save_state(self):
+        if self.dry:
+            return
+        self.state["recent_flips"] = sorted(self.flipped_ids)
+        tmp = self.state_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.state, f)
+        os.replace(tmp, self.state_path)
+
+    # -------------------------------------------------- undrudge CLI
+
+    def undrudge(self, verb, rec_id, why=""):
+        if self.dry:
+            log("[dry] undrudge %s %s (%s)" % (verb, rec_id[:12], why))
+            return True
+        rc, out, err = run_cmd([self.cfg["undrudge_bin"], verb, rec_id[:12]], timeout=30)
+        if rc == 0:
+            self.flips += 1
+            self.flipped_ids.add(rec_id[:12])
+            log("undrudge %s %s ok (%s)" % (verb, rec_id[:12], why))
+            return True
+        self.report["failures"].append("undrudge %s %s failed rc=%s: %s %s"
+                                       % (verb, rec_id[:12], rc, out, err))
+        return False
+
+    # -------------------------------------------------- db access
+
+    def db_query(self, sql, params=()):
+        """Read-only query with retry — the 02:30 analyze / hourly gather write
+        this WAL db, and wake-coalesced launchd jobs can fire simultaneously."""
+        last = None
+        for attempt in range(3):
+            conn = None
+            try:
+                conn = sqlite3.connect("file:%s?mode=ro" % self.cfg["undrudge_db"],
+                                       uri=True, timeout=30)
+                return conn.execute(sql, params).fetchall()
+            except sqlite3.OperationalError as e:
+                last = e
+                time.sleep(2)
+            finally:
+                if conn is not None:
+                    conn.close()
+        raise last
+
+    def fetch_logged(self):
+        rows = self.db_query(
+            "SELECT id, scope, title, signature, body_path, created_at "
+            "FROM recommendations WHERE status='logged' ORDER BY created_at")
+        recs = []
+        for rid, scope, title, sig, body_path, created in rows:
+            fm, body = parse_frontmatter(body_path)
+            recs.append(dict(id=rid, id12=rid[:12], scope=scope, title=title,
+                             signature=sig, body_path=body_path, created=created,
+                             fm=fm, body=body, forced=False, forced_route=None))
+        return recs
+
+    def fetch_dismissed_sigs(self):
+        rows = self.db_query("SELECT id, title, signature FROM recommendations "
+                             "WHERE status='dismissed'")
+        return [(r[0][:12], r[1], canonical_sig(r[2])) for r in rows]
+
+    def resolve_cwds(self, fm):
+        refs = fm.get("evidence_refs") or []
+        counts = {}
+        for ref in refs:
+            eid = re.sub(r"[^0-9a-f]", "", str(ref.get("external_id", "")).lower())
+            if len(eid) < 6:
+                continue
+            src = ref.get("source", "")
+            try:
+                if src in ("atuin", "shell"):
+                    rows = self.db_query(
+                        "SELECT cwd FROM commands WHERE replace(external_id,'-','') "
+                        "LIKE ? LIMIT 5", (eid + "%",))
+                elif src in ("claude", "msg"):
+                    rows = self.db_query(
+                        "SELECT s.project FROM messages m JOIN sessions s "
+                        "ON m.session_id = s.id WHERE replace(m.id,'-','') "
+                        "LIKE ? LIMIT 5", (eid + "%",))
+                elif src == "session":
+                    rows = self.db_query(
+                        "SELECT project FROM sessions WHERE replace(id,'-','') "
+                        "LIKE ? LIMIT 5", (eid + "%",))
+                else:
+                    rows = []
+            except sqlite3.OperationalError:
+                continue
+            for (cwd,) in rows:
+                if cwd:
+                    counts[cwd] = counts.get(cwd, 0) + 1
+        return [c for c, _ in sorted(counts.items(), key=lambda kv: -kv[1])]
+
+    # -------------------------------------------------- routing & gating
+
+    def route_by_name(self, name):
+        for route in self.cfg["routes"]:
+            if route["name"] == name:
+                return route
+        return None
+
+    def title_route_hint(self, rec):
+        """A route whose name appears verbatim in the rec title is a strong
+        signal — undrudge evidence cwds often point at where a command RAN,
+        not what it was ABOUT (e.g. volpe-lite work done from an ops clone)."""
+        hits = []
+        for route in self.cfg["routes"]:
+            name = route["name"]
+            if name in ("vault", "undrudge") or len(name) < 3:
+                continue  # too generic in this corpus
+            if re.search(r"\b%s\b" % re.escape(name), rec["title"] or "", re.I):
+                hits.append(route)
+        return hits[0] if len(hits) == 1 else None
+
+    def route_for(self, rec):
+        if rec["fm"].get("target_scope") == "agent_global":
+            return self.route_by_name("vault")
+        cwds = self.resolve_cwds(rec["fm"])
+        rec["cwds"] = cwds
+        hint = self.title_route_hint(rec)
+        cwd_route = None
+        for cwd in cwds:
+            for route in self.cfg["routes"]:
+                if any(path_under(cwd, p) for p in route.get("cwd_prefixes", [])):
+                    cwd_route = route
+                    break
+            if cwd_route:
+                break
+        if cwd_route is None:
+            for cwd in cwds:
+                if os.path.isdir(cwd):
+                    rc, out, _ = run_cmd([self.cfg["git_bin"], "-C", cwd, "remote",
+                                          "get-url", "origin"], timeout=10,
+                                         extra_env=GIT_ENV)
+                    if rc == 0:
+                        origin = normalize_origin(out)
+                        for route in self.cfg["routes"]:
+                            if origin and origin in route.get("origins", []):
+                                cwd_route = route
+                                break
+                if cwd_route:
+                    break
+        if hint and cwd_route and hint["name"] != cwd_route["name"]:
+            self.report["notes"].append(
+                "%s: title names `%s`, evidence cwds suggested `%s` — routed by title"
+                % (rec["id12"], hint["name"], cwd_route["name"]))
+            return hint
+        return cwd_route or hint
+
+    def deny_hit(self, rec):
+        hay = " ".join([rec["title"] or "", rec["signature"] or "", rec["body"] or ""])
+        for pat in self.cfg["deny_patterns"]:
+            if re.search(pat, hay, re.I):
+                return pat
+        return None
+
+    def similar_dismissed(self, rec, dismissed):
+        sig = canonical_sig(rec["signature"])
+        if len(sig) < self.cfg["similarity_min_sig_len"]:
+            return None
+        for d_id, d_title, d_sig in dismissed:
+            if len(d_sig) < self.cfg["similarity_min_sig_len"]:
+                continue
+            if difflib.SequenceMatcher(None, sig, d_sig).ratio() >= self.cfg["similarity_threshold"]:
+                return (d_id, d_title)
+        return None
+
+    # -------------------------------------------------- approvals
+
+    def parse_approvals(self):
+        """Checked boxes in dispatch-queue.md. Grammar:
+        - [x] approve <id-prefix> [-> <route>]
+        - [x] dismiss <id-prefix> [— reason: ...]
+        Returns {prefix: (action, route_or_None, reason)}, [malformed lines]."""
+        actions, malformed = {}, []
+        if not os.path.exists(self.queue_path):
+            return actions, malformed
+        pat = re.compile(r"^\s*-\s*\[[xX]\]\s*(approve|dismiss)\s+([0-9a-f]{6,64})"
+                         r"(?:\s*(?:->|route:)\s*([A-Za-z0-9_-]+))?"
+                         r"(?:\s*[—-]+\s*reason:\s*(.*))?\s*$")
+        for line in open(self.queue_path, encoding="utf-8"):
+            if re.match(r"^\s*-\s*\[[xX]\]", line):
+                m = pat.match(line)
+                if m:
+                    actions[m.group(2)] = (m.group(1), m.group(3), (m.group(4) or "").strip())
+                else:
+                    malformed.append(line.strip())
+        return actions, malformed
+
+    def resolve_approvals(self, raw, recs):
+        """Prefix-match approval keys against logged rec ids (CLI semantics)."""
+        resolved = {}
+        for key, action in raw.items():
+            matches = [r for r in recs if r["id"].startswith(key)]
+            if len(matches) == 1:
+                resolved[matches[0]["id12"]] = action
+            elif len(matches) > 1:
+                self.report["failures"].append("approval `%s` is ambiguous (%d matches)"
+                                               % (key, len(matches)))
+            else:
+                self.report["failures"].append(
+                    "approval `%s` matches no logged rec (already closed?)" % key)
+        return resolved
+
+    # -------------------------------------------------- reconcile
+
+    def collect_verdicts(self):
+        """Verdict files from route done/ dirs and the central spool."""
+        found = []
+        for route in self.cfg["routes"]:
+            done_dir = os.path.join(route["dir"], ".undrudge-inbox", "done")
+            if os.path.isdir(done_dir):
+                for fn in sorted(os.listdir(done_dir)):
+                    if fn.endswith(".verdict.json"):
+                        found.append((os.path.join(done_dir, fn), route["name"]))
+        if os.path.isdir(self.spool_dir):
+            for fn in sorted(os.listdir(self.spool_dir)):
+                if fn.endswith(".verdict.json"):
+                    found.append((os.path.join(self.spool_dir, fn), "spool"))
+        return found
+
+    def reconcile(self):
+        logged_ids = set()
+        all_ids = []
+        for (rid,) in self.db_query("SELECT id FROM recommendations"):
+            all_ids.append(rid)
+        for (rid,) in self.db_query("SELECT id FROM recommendations WHERE status='logged'"):
+            logged_ids.add(rid[:12])
+
+        def resolve_rid(prefix):
+            m = [i for i in all_ids if i.startswith(prefix)]
+            return m[0][:12] if len(m) == 1 else prefix[:12]
+
+        for path, route_name in self.collect_verdicts():
+            v = load_json(path, {})
+            rid = resolve_rid(v.get("id") or os.path.basename(path).split(".")[0])
+            if self.has_action(rid, "verdict"):
+                continue
+            d = v.get("disposition", "")
+            # flip FIRST; only ledger the verdict once the flip stuck (or none needed),
+            # so a transient CLI failure is retried on the next run
+            if rid in logged_ids and d in DISMISS_CLASS:
+                if not self.undrudge("dismiss", rid, "verdict %s" % d):
+                    continue
+            elif rid in logged_ids and d == "already-done":
+                if not self.undrudge("implement", rid, "verdict already-done"):
+                    continue
+            self.ledger_append(rid, "verdict", disposition=d, reason=v.get("reason"),
+                               artifact=v.get("artifact"), route=route_name)
+            self.report["verdicts"].append("%s [%s] %s — %s" % (
+                rid, route_name, d, (v.get("reason") or "")[:140]))
+
+        # standing holds: needs-human / convert-to-task verdicts re-surface every
+        # run until the rec leaves 'logged' (human dismisses/converts it)
+        for rid, entries in self.ledger.items():
+            v = self.last_verdict(rid)
+            if v and v.get("disposition") in NEEDS_HUMAN and rid in logged_ids:
+                self.verdict_holds[rid] = (v["disposition"], v.get("reason") or "")
+
+        # poll open ship PRs
+        for rid, entries in list(self.ledger.items()):
+            ship = next((e for e in entries if e.get("action") == "verdict"
+                         and e.get("disposition") == "ship"), None)
+            if not ship or self.has_action(rid, "pr-merged", "pr-closed"):
+                continue
+            artifact = ship.get("artifact") or ""
+            if not str(artifact).startswith("http"):
+                if rid not in logged_ids:
+                    continue  # already closed out (e.g. non-git route implemented directly)
+                if not self.has_action(rid, "artifact-unusable"):
+                    self.ledger_append(rid, "artifact-unusable", artifact=artifact)
+                    self.report["failures"].append(
+                        "%s ship verdict has no usable PR URL (artifact=%r) — needs manual close-out"
+                        % (rid, artifact))
+                continue
+            route = self.route_by_name(ship.get("route", "")) or {}
+            rc, out, _ = run_cmd([self.cfg["gh_bin"], "pr", "view", artifact,
+                                  "--json", "state,mergedAt,url"], timeout=30,
+                                 cwd=route.get("dir") if os.path.isdir(route.get("dir", "")) else None)
+            if rc != 0:
+                self.report["pending_prs"].append("%s %s (gh unavailable)" % (rid, artifact))
+                continue
+            try:
+                state = json.loads(out).get("state", "")
+            except Exception:
+                state = ""
+            if state == "MERGED":
+                if self.undrudge("implement", rid, "PR merged"):
+                    self.ledger_append(rid, "pr-merged", artifact=artifact)
+                    self.report["completed"].append("%s implemented (PR merged %s)" % (rid, artifact))
+            elif state == "CLOSED":
+                if self.undrudge("dismiss", rid, "PR closed unmerged"):
+                    self.ledger_append(rid, "pr-closed", artifact=artifact)
+                    self.report["completed"].append("%s dismissed (PR closed %s)" % (rid, artifact))
+            else:
+                self.report["pending_prs"].append("%s %s (open since %s)"
+                                                  % (rid, artifact, (ship.get("ts") or "")[:10]))
+
+    def events_since_last_run(self):
+        path = self.cfg["events_file"]
+        if not os.path.exists(path):
+            return
+        size = os.path.getsize(path)
+        if "events_offset" not in self.state:
+            self.state["events_offset"] = size   # first run: skip history
+            return
+        offset = int(self.state["events_offset"])
+        if offset > size:
+            self.report["notes"].append("events.jsonl shrank — offset reset, skipping to EOF")
+            self.state["events_offset"] = size
+            return
+        own = set(self.state.get("recent_flips", [])) | self.flipped_ids
+        with open(path, encoding="utf-8") as f:
+            f.seek(offset)
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                eid = str(e.get("id", ""))[:12]
+                if e.get("event") in ("rec_dismissed", "rec_implemented") and eid not in own:
+                    self.report["completed"].append("%s %s (outside dispatcher)" % (eid, e.get("event")))
+            self.state["events_offset"] = f.tell()
+
+    # -------------------------------------------------- dispatch
+
+    def route_dir_ok(self, route):
+        d = route["dir"]
+        if os.path.isdir(d) and os.listdir(d):
+            return None
+        if route.get("_managed_clone") and route.get("clone_url"):
+            if self.dry:
+                log("[dry] would clone %s -> %s" % (route["clone_url"], d))
+                return None
+            os.makedirs(os.path.dirname(d), exist_ok=True)
+            log("cloning %s -> %s" % (route["clone_url"], d))
+            rc, out, err = run_cmd([self.cfg["git_bin"], "clone", "--quiet",
+                                    route["clone_url"], d], timeout=600, extra_env=GIT_ENV)
+            if rc != 0:
+                return "clone failed for %s: %s %s" % (route["name"], out[:200], err[:200])
+            return None
+        return "route dir %s missing or empty — clone deleted/moved?" % d
+
+    def sync_route(self, route):
+        spec = route.get("sync")
+        if not spec:
+            return None
+        d, git = route["dir"], self.cfg["git_bin"]
+        rc, out, _ = run_cmd([git, "-C", d, "status", "--porcelain", "-uno",
+                              "--ignore-submodules=all"], timeout=20, extra_env=GIT_ENV)
+        if rc != 0:
+            return "git status failed in %s" % d
+        if out.strip():
+            return "tracked files dirty in %s — refusing to sync:\n%s" % (d, out[:300])
+        if self.dry:
+            log("[dry] would sync %s (%s)" % (d, ", ".join(spec)))
+            return None
+        for step in spec:
+            if step == "fetch":
+                argv = [git, "-C", d, "-c", "fetch.recurseSubmodules=no", "fetch", "--quiet"]
+            elif step.startswith("switch:"):
+                argv = [git, "-C", d, "switch", "--quiet", step.split(":", 1)[1]]
+            elif step == "pull":
+                argv = [git, "-C", d, "-c", "fetch.recurseSubmodules=no",
+                        "pull", "--ff-only", "--quiet"]
+            else:
+                return "unknown sync step %r" % step
+            rc, out, err = run_cmd(argv, timeout=120, extra_env=GIT_ENV)
+            if rc != 0:
+                return "sync step %r failed in %s: %s %s" % (step, d, out[:200], err[:200])
+        return None
+
+    def freshness(self, route):
+        d = route["dir"]
+        rc, branch, _ = run_cmd([self.cfg["git_bin"], "-C", d, "branch",
+                                 "--show-current"], timeout=10, extra_env=GIT_ENV)
+        rc2, gitlog, _ = run_cmd([self.cfg["git_bin"], "-C", d, "log", "--oneline",
+                                  "-15", "--since=4.weeks"], timeout=20, extra_env=GIT_ENV)
+        prs = ""
+        rc3, out, _ = run_cmd([self.cfg["gh_bin"], "pr", "list", "--state", "merged",
+                               "--limit", "10"], timeout=30,
+                              cwd=d if os.path.isdir(d) else None)
+        if rc3 == 0:
+            prs = out
+        return branch if rc == 0 else "?", gitlog if rc2 == 0 else "(no git log)", prs
+
+    def ensure_inbox(self, route):
+        inbox = os.path.join(route["dir"], ".undrudge-inbox")
+        if not self.dry:
+            os.makedirs(os.path.join(inbox, "done"), exist_ok=True)
+            exclude = os.path.join(route["dir"], ".git", "info", "exclude")
+            if os.path.isfile(exclude):
+                content = open(exclude, encoding="utf-8").read()
+                if ".undrudge-inbox" not in content:
+                    with open(exclude, "a", encoding="utf-8") as f:
+                        f.write("\n.undrudge-inbox/\n")
+        return inbox
+
+    def write_brief(self, rec, route, branch, gitlog, prs):
+        inbox = self.ensure_inbox(route)
+        path = os.path.join(inbox, "%s.md" % rec["id12"])
+        ev_lines = "\n".join("- %s" % c for c in rec.get("cwds", [])[:6]) or "- (no evidence cwds resolved)"
+        brief = """# undrudge brief — {id12} — {title}
+
+Generated {today} by undrudge-dispatch (deterministic courier — no LLM touched this).
+Target: {dir} (route `{route}`) · confidence **{conf}** · form **{form}** · scope {scope}
+
+## Recommendation (verbatim)
+
+{body}
+
+## Resolved evidence locations (from the undrudge DB)
+
+{ev}
+
+## Recent activity here (staleness check — recs lag the codebase by 2–4 weeks)
+
+Branch: `{branch}`
+
+```
+{gitlog}
+```
+
+Recently merged PRs:
+
+```
+{prs}
+```
+
+## Triage contract
+
+Verify before building (rec evidence can be hallucinated or stale):
+1. Cited files/commands/paths exist in THIS tree.
+2. The pain is steady-state, not a one-off burst that already ended (check evidence dates).
+3. Not already solved (check the git log / merged PRs above).
+4. Doesn't target the retired sbx/QC stack and doesn't automate the manual /rat:inbox loop.
+
+Dispositions:
+- **ship** — branch `undrudge/{id12}-<slug>`, commit `undrudge:{id12} <title>`, open a **draft** PR (try `--label undrudge`); artifact MUST be the full PR URL; do NOT flip undrudge status — the dispatcher implements it when the PR merges.
+- **dismiss-stale** / **reject-as-framed** — run `undrudge dismiss {id12}` now.
+- **already-done** — run `undrudge implement {id12}`.
+- **convert-to-task** — verdict only; the dispatcher surfaces it in the vault queue until it's converted.
+- **needs-human** — verdict only, with what you'd need to proceed.
+
+When decided: write `done/{id12}.verdict.json` `{{"id": "{id12}", "disposition": "...", "reason": "...", "artifact": "<full PR URL or null>"}}` and move this brief into `done/`. The global `/undrudge-check` command knows this whole procedure.
+""".format(id12=rec["id12"], title=rec["title"], today=self.today, dir=route["dir"],
+           route=route["name"], conf=rec["fm"].get("confidence", "?"),
+           form=rec["fm"].get("automation_form", "?"), scope=rec["fm"].get("target_scope", "?"),
+           body=rec["body"].strip(), ev=ev_lines, branch=branch, gitlog=gitlog or "(quiet)",
+           prs=prs or "(gh unavailable or no recent merges)")
+        if self.dry:
+            log("[dry] would write brief %s" % path)
+        elif not os.path.exists(path):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(brief)
+        return path
+
+    # -------------------------------------------------- cmux staging
+
+    def cmux(self, *args, timeout=20):
+        env = dict(os.environ)
+        env["CMUX_QUIET"] = "1"
+        try:
+            p = subprocess.run([self.cfg["cmux_bin"]] + list(args), capture_output=True,
+                               text=True, timeout=timeout, env=env)
+            return p.returncode, p.stdout.strip()
+        except Exception as e:
+            return 127, str(e)
+
+    def inbox_count(self, route):
+        inbox = os.path.join(route["dir"], ".undrudge-inbox")
+        if not os.path.isdir(inbox):
+            return 0
+        return len([f for f in os.listdir(inbox) if f.endswith(".md")])
+
+    def stage_all(self):
+        """Stage every route that HAS waiting briefs — driven by inbox contents,
+        not by this run's dispatch count, so a morning when cmux was down gets
+        retried on the next run."""
+        notes = []
+        if self.cfg.get("staging") != "cmux":
+            return notes
+        cmux_ok = self.cmux("ping")[0] == 0
+        for route in self.cfg["routes"]:
+            n = self.inbox_count(route)
+            if n == 0:
+                continue
+            if route.get("stage") == "notify":
+                notes.append("%s: %d brief(s) waiting — handle via /undrudge-queue" % (route["name"], n))
+                continue
+            if route.get("stage") != "cmux":
+                continue
+            if not cmux_ok:
+                notes.append("%s: %d brief(s) waiting, cmux not running — staging deferred" % (route["name"], n))
+                continue
+            name = "undrudge:%s" % route["name"]
+            rc, out = self.cmux("list-workspaces")
+            existing = None
+            for line in out.splitlines():
+                m = re.match(r"^\*?\s*(workspace:\d+)\s+(.+?)(?:\s+\[selected\])?\s*$", line)
+                if m and m.group(2).strip() == name:
+                    existing = m.group(1)
+            if existing:
+                notes.append("%s: %d brief(s), workspace already open (%s)" % (route["name"], n, existing))
+                continue
+            if self.dry:
+                notes.append("%s: [dry] would create workspace %s (%d briefs)" % (route["name"], name, n))
+                continue
+            rc, out = self.cmux("new-workspace", "--name", name, "--cwd", route["dir"],
+                                "--focus", "false")
+            m = re.search(r"(workspace:\d+)", out)
+            if rc != 0 or not m:
+                notes.append("%s: new-workspace failed: %s" % (route["name"], out))
+                continue
+            ref = m.group(1)
+            time.sleep(2)
+            rc, out = self.cmux("send", "--workspace", ref, self.cfg["pretyped_cmd"])
+            if rc != 0:
+                notes.append("%s: created %s but pre-type failed: %s" % (route["name"], ref, out))
+            else:
+                notes.append("%s: created %s, %d brief(s), launch pre-typed — press Enter"
+                             % (route["name"], ref, n))
+        return notes
+
+    def notify(self, summary):
+        if self.dry:
+            log("[dry] notify: %s" % summary)
+            return
+        self.cmux("notify", "--title", "undrudge dispatch", "--body", summary)
+        if self.cfg.get("osascript_notify"):
+            run_cmd(["/usr/bin/osascript", "-e",
+                     'display notification "%s" with title "undrudge dispatch"'
+                     % summary.replace('"', "'")], timeout=10)
+
+    # -------------------------------------------------- health
+
+    def health(self):
+        h = self.report["health"]
+        rc, out, _ = run_cmd(["/bin/launchctl", "list"], timeout=15)
+        if rc == 0:
+            for label in ("undrudge.gather", "undrudge.analyze", "undrudge.dispatch"):
+                m = re.search(r"^(\S+)\s+(-?\d+)\s+%s$" % re.escape(label), out, re.M)
+                if m:
+                    status = m.group(2)
+                    h.append("%s last exit: %s%s" % (label, status,
+                             "  ⚠️" if status != "0" else ""))
+                elif label == "undrudge.dispatch":
+                    h.append("undrudge.dispatch NOT LOADED in launchd  ⚠️")
+        # gather health: key off the LATEST gather_complete event (schema agreed
+        # with undrudge 2026-06-10) — transients a later run recovered are info,
+        # not a standing FAIL. Fallback to log-grep on pre-upgrade undrudge.
+        latest_complete, transient_fails = None, 0
+        cutoff_ms = (time.time() - 86400) * 1000
+        for line in tail_lines(self.cfg["events_file"], 500, 256 * 1024):
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            if (e.get("ts") or 0) < cutoff_ms:
+                continue
+            if e.get("event") == "gather_failed":
+                transient_fails += 1
+            elif e.get("event") == "gather_complete":
+                latest_complete = e
+        if latest_complete is not None:
+            failed = latest_complete.get("failed_sources") or []
+            if failed:
+                h.append("gather: latest run FAILING sources: %s  ⚠️" % ", ".join(failed))
+            elif transient_fails:
+                h.append("gather: healthy (%d transient failure(s) self-healed in 24h)" % transient_fails)
+            else:
+                h.append("gather: healthy")
+        else:
+            n = sum(1 for l in tail_lines(self.cfg["gather_log"], 200) if "OperationalError" in l)
+            if n:
+                h.append("gather.log: %d OperationalError lines in last 200  ⚠️ (pre-upgrade fallback)" % n)
+        try:
+            pid = int(open(self.cfg["a2a_pidfile"]).read().split()[0])
+            os.kill(pid, 0)
+            h.append("a2a daemon: running (pid %d)" % pid)
+        except Exception:
+            h.append("a2a daemon: NOT RUNNING  ⚠️")
+        free_gb = shutil.disk_usage(os.path.expanduser("~")).free / 2**30
+        h.append("disk free: %.0f GB%s" % (free_gb, "  ⚠️" if free_gb < 15 else ""))
+        for route in self.cfg["routes"]:
+            inbox = os.path.join(route["dir"], ".undrudge-inbox")
+            if os.path.isdir(inbox):
+                briefs = [f for f in os.listdir(inbox) if f.endswith(".md")]
+                if briefs:
+                    oldest = min(os.path.getmtime(os.path.join(inbox, f)) for f in briefs)
+                    h.append("inbox %s: %d brief(s) waiting, oldest %.1fd%s"
+                             % (route["name"], len(briefs), age_days(oldest),
+                                "  ⚠️" if age_days(oldest) > 3 else ""))
+
+    # -------------------------------------------------- report / queue
+
+    def write_report(self, staging_notes):
+        r = self.report
+        lines = ["", "## run @ %s%s" % (self.now_hm, " (dry)" if self.dry else ""), ""]
+
+        def section(title, items, empty="none"):
+            lines.append("### %s" % title)
+            if items:
+                lines.extend("- %s" % i for i in items)
+            else:
+                lines.append("- _%s_" % empty)
+            lines.append("")
+
+        section("Dispatched", r["dispatched"])
+        section("Staging", staging_notes)
+        section("Held for approval (see dispatch-queue.md)", r["held"])
+        if self.cfg["apply_denylist"]:
+            section("Auto-dismissed (deny-list)", r["auto_dismissed"])
+        else:
+            section("Deny-list matches (SHADOW MODE — flowing normally; flip apply_denylist to enact)",
+                    r["would_dismiss"])
+        section("Verdicts collected", r["verdicts"])
+        section("Completed since last run", r["completed"])
+        section("Draft PRs awaiting review", r["pending_prs"])
+        section("Approvals processed", r["approvals"])
+        section("Routing notes", r["notes"])
+        section("Failures", r["failures"], empty="none 🎉")
+        section("Health", r["health"])
+        out = "\n".join(lines)
+        if self.dry:
+            print("\n========== REPORT (dry-run, not written) ==========" + out)
+            return
+        os.makedirs(self.log_dir, exist_ok=True)
+        day_path = os.path.join(self.log_dir, "%s.md" % self.today)
+        header = "" if os.path.exists(day_path) else "# undrudge dispatch — %s\n" % self.today
+        with open(day_path, "a", encoding="utf-8") as f:
+            f.write(header + out)
+
+    def write_queue(self, holds):
+        def classify(why):
+            if why.startswith("verdict"):
+                return "Needs human (session verdicts)"
+            if why.startswith("cross_cutting") or why.startswith("no route"):
+                return "Routing needed — repo, dotfiles, or personal habit?"
+            if "approval-only" in why:
+                return "Approval-only routes"
+            if why.startswith("gate:"):
+                return "Below the auto-gate (often personal/process suggestions)"
+            if "similar to dismissed" in why:
+                return "Probable repeats of dismissed recs"
+            return "Deferred (will retry on a later run)"
+
+        sections = {}
+        for rec, why in holds:
+            sections.setdefault(classify(why), []).append((rec, why))
+
+        lines = [
+            "# undrudge dispatch queue", "",
+            "Best UX: open the devlog session and run `/undrudge-queue` to triage these",
+            "conversationally. Checkbox fallback — the next dispatcher run (07:00/12:30, or",
+            "`undrudge-dispatch run`) acts on ticked boxes:",
+            "`- [x] approve <id>` dispatches despite the gate (add `-> <route>` to name the",
+            "target for unrouted recs: ops, strata, volpe-lite, fab, undrudge, vault, maryanne)",
+            "· `- [x] dismiss <id> — reason: ...` dismisses.",
+            "",
+        ]
+        for title in ("Needs human (session verdicts)",
+                      "Routing needed — repo, dotfiles, or personal habit?",
+                      "Below the auto-gate (often personal/process suggestions)",
+                      "Probable repeats of dismissed recs",
+                      "Approval-only routes",
+                      "Deferred (will retry on a later run)"):
+            if title not in sections:
+                continue
+            lines.append("## %s" % title)
+            lines.append("")
+            for rec, why in sections[title]:
+                lines.append("### %s — %s" % (rec["id12"], rec["title"]))
+                lines.append("*%s* · confidence %s · form %s · scope %s" % (
+                    why, rec["fm"].get("confidence", "?"), rec["fm"].get("automation_form", "?"),
+                    rec["fm"].get("target_scope", "?")))
+                lines.append("`undrudge show %s`" % rec["id12"])
+                needs_route = why.startswith("cross_cutting") or why.startswith("no route")
+                lines.append("- [ ] approve %s%s" % (rec["id12"], " -> " if needs_route else ""))
+                lines.append("- [ ] dismiss %s — reason: " % rec["id12"])
+                lines.append("")
+        if not holds:
+            lines.append("_Queue empty._")
+        if self.dry:
+            log("[dry] queue would list %d held rec(s)" % len(holds))
+            return
+        os.makedirs(os.path.dirname(self.queue_path), exist_ok=True)
+        with open(self.queue_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+    # -------------------------------------------------- main run
+
+    def run(self):
+        raw_approvals, malformed = self.parse_approvals()
+        for line in malformed:
+            self.report["failures"].append("malformed approval line ignored: %s" % line)
+
+        self.reconcile()
+        self.events_since_last_run()
+
+        recs = self.fetch_logged()
+        dismissed = self.fetch_dismissed_sigs()
+        approvals = self.resolve_approvals(raw_approvals, recs)
+        holds, normal, forced = [], [], []
+
+        for rec in recs:
+            rid = rec["id12"]
+            act = approvals.get(rid)
+            if act and act[0] == "dismiss":
+                if self.undrudge("dismiss", rid, "human via dispatch-queue"):
+                    self.report["approvals"].append("%s dismissed — %s" % (rid, act[2] or "no reason given"))
+                    self.ledger_append(rid, "human-dismissed", reason=act[2])
+                continue
+            if rid in self.verdict_holds:
+                d, reason = self.verdict_holds[rid]
+                holds.append((rec, "verdict %s — %s" % (d, reason[:120])))
+                continue
+            if self.has_action(rid, "verdict"):
+                continue  # ship pending PR review — reconcile owns it now
+            if self.has_action(rid, "dispatched"):
+                continue
+
+            is_forced = bool(act and act[0] == "approve")
+            if is_forced:
+                rec["forced"] = True
+                rec["forced_route"] = act[1]
+
+            pat = self.deny_hit(rec)
+            if pat and not is_forced:
+                if self.cfg["apply_denylist"]:
+                    if self.undrudge("dismiss", rid, "deny-list %s" % pat):
+                        self.report["auto_dismissed"].append("%s %s (pattern `%s`)" % (rid, rec["title"], pat))
+                        self.ledger_append(rid, "auto-dismissed", pattern=pat)
+                    continue
+                # shadow mode: record the match but let the rec flow normally
+                self.report["would_dismiss"].append("%s %s (pattern `%s`)" % (rid, rec["title"], pat))
+
+            if not is_forced:
+                sim = self.similar_dismissed(rec, dismissed)
+                if sim:
+                    holds.append((rec, "≥%.0f%% similar to dismissed %s (%s)" %
+                                  (self.cfg["similarity_threshold"] * 100, sim[0], sim[1])))
+                    continue
+                if rec["fm"].get("target_scope") == "cross_cutting":
+                    holds.append((rec, "cross_cutting scope — needs a human routing decision"))
+                    continue
+
+            if rec["forced_route"]:
+                route = self.route_by_name(rec["forced_route"])
+                if route is None:
+                    self.report["failures"].append("%s approved with unknown route `%s`"
+                                                   % (rid, rec["forced_route"]))
+                    holds.append((rec, "no route resolved (approved with unknown route name)"))
+                    continue
+            else:
+                route = self.route_for(rec)
+            if route is None:
+                why = "no route resolved (scope %s)" % rec["fm"].get("target_scope")
+                if is_forced:
+                    why = "no route resolved — re-tick with `approve %s -> <route>`" % rid
+                holds.append((rec, why))
+                continue
+            rec["route"] = route
+
+            conf_ok = rec["fm"].get("confidence") in self.cfg["gate_confidence"]
+            form_ok = rec["fm"].get("automation_form") in self.cfg["gate_forms"]
+            if is_forced:
+                forced.append(rec)
+            elif route.get("auto") and conf_ok and form_ok:
+                normal.append(rec)
+            else:
+                why = ("route %s is approval-only" % route["name"]) if not route.get("auto") \
+                    else "gate: confidence=%s form=%s" % (rec["fm"].get("confidence"),
+                                                          rec["fm"].get("automation_form"))
+                holds.append((rec, why))
+
+        # human approvals are exempt from the cap; the rest get priority order
+        normal.sort(key=lambda r: (0 if r["route"]["name"] == "vault" else 1,
+                                   0 if r["scope"] == "weekly" else 1,
+                                   r["created"] or ""))
+        cap = self.cfg["max_dispatch_per_run"]
+        overflow = normal[cap:]
+        to_dispatch = forced + normal[:cap]
+        for rec in overflow:
+            holds.append((rec, "daily cap reached — will dispatch on a later run"))
+
+        by_route = {}
+        for rec in to_dispatch:
+            by_route.setdefault(rec["route"]["name"], []).append(rec)
+        for rname, rrecs in by_route.items():
+            route = rrecs[0]["route"]
+            err = self.route_dir_ok(route) or self.sync_route(route)
+            if err:
+                self.report["failures"].append("route %s: %s" % (rname, err))
+                for rec in rrecs:
+                    holds.append((rec, "route %s unavailable — see failures" % rname))
+                continue
+            branch, gitlog, prs = self.freshness(route)
+            for rec in rrecs:
+                self.write_brief(rec, route, branch, gitlog, prs)
+                self.ledger_append(rec["id12"], "dispatched", route=rname, title=rec["title"])
+                self.report["dispatched"].append("%s → %s — %s" % (rec["id12"], rname, rec["title"]))
+                if rec["forced"]:
+                    self.report["approvals"].append("%s approved → dispatched to %s" % (rec["id12"], rname))
+
+        staging_notes = self.stage_all()
+        self.health()
+        self.write_queue(holds)
+        for rec, why in holds:
+            self.report["held"].append("%s %s — %s" % (rec["id12"], rec["title"], why))
+        self.write_report(staging_notes)
+
+        if self.flips and not self.dry:
+            rc, out, err = run_cmd(self.cfg["mirror_cmd"], timeout=60)
+            if rc != 0:
+                log("mirror refresh failed: %s %s" % (out, err))
+
+        self.save_state()
+
+        r = self.report
+        if r["dispatched"] or r["held"] or r["completed"] or r["failures"] or r["verdicts"]:
+            parts = []
+            if r["dispatched"]:
+                parts.append("%d dispatched (%s)" % (len(r["dispatched"]), ", ".join(sorted(by_route))))
+            if r["held"]:
+                parts.append("%d for your review (/undrudge-queue in devlog)" % len(r["held"]))
+            if r["pending_prs"]:
+                parts.append("%d PRs awaiting review" % len(r["pending_prs"]))
+            if r["failures"]:
+                parts.append("%d FAILURES — see dispatch-log" % len(r["failures"]))
+            self.notify("; ".join(parts) + ". dispatch-log/%s.md" % self.today)
+        log("done: %d dispatched, %d held, %d flips, %d failures" %
+            (len(r["dispatched"]), len(r["held"]), self.flips, len(r["failures"])))
+
+    def status(self):
+        recs = self.fetch_logged()
+        print("logged recs: %d" % len(recs))
+        for rec in recs:
+            if rec["id12"] in self.verdict_holds:
+                disp = "needs-human"
+            elif self.has_action(rec["id12"], "verdict"):
+                disp = "pr-pending"
+            elif self.has_action(rec["id12"], "dispatched"):
+                disp = "dispatched"
+            else:
+                disp = "pending"
+            print("  %s  %-11s %s" % (rec["id12"], disp, rec["title"]))
+        for route in self.cfg["routes"]:
+            n = self.inbox_count(route)
+            if n:
+                print("inbox %-12s %d brief(s) waiting" % (route["name"], n))
+
+    def crash_report(self, exc_text):
+        """Best-effort: a crash must never be silent."""
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+            with open(os.path.join(self.log_dir, "%s.md" % self.today), "a", encoding="utf-8") as f:
+                f.write("\n## run @ %s — CRASHED\n\n```\n%s\n```\n" % (self.now_hm, exc_text[-2000:]))
+        except Exception:
+            pass
+        try:
+            self.notify("dispatch CRASHED — see dispatch-log/%s.md" % self.today)
+        except Exception:
+            pass
+
+
+def main():
+    args = sys.argv[1:]
+    dry = "--dry-run" in args
+    cmd = next((a for a in args if not a.startswith("-")), "run")
+    cfg = load_json(CONFIG_PATH, None)
+    if cfg is None:
+        print("config missing/invalid: %s" % CONFIG_PATH, file=sys.stderr)
+        return 2
+    trim_log(os.path.join(cfg["state_dir"], "logs", "dispatch.log"))
+    d = Dispatcher(cfg, dry=dry)
+    if cmd == "status":
+        d.status()
+        return 0
+    lock_path = os.path.join(cfg["state_dir"], "lock" + (".dry" if dry else ""))
+    lock = open(lock_path, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("another dispatcher run holds the lock — exiting", file=sys.stderr)
+        return 1
+    try:
+        d.run()
+        return 0
+    except Exception:
+        exc = traceback.format_exc()
+        print(exc, file=sys.stderr)
+        d.crash_report(exc)
+        return 1
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
