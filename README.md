@@ -84,9 +84,21 @@ undrudge analyze week        # weekly meta digest → recs (7d trailing, --meta)
 undrudge analyze --dry-run day    # daily run, but write to dry-run/ (skip DB+hook)
 undrudge digest --window 24h --out -   # render a digest only (no LLM call)
 undrudge list                # show recommendations
-undrudge dismiss <id>        # mark a rec dismissed (full id or any unique prefix)
-undrudge implement <id>      # mark a rec implemented
+undrudge dismiss <id> [--reason ...]    # mark a rec dismissed (full id or unique prefix)
+undrudge implement <id> [--reason ...]  # mark a rec implemented
+undrudge mark <id> <status> [--reason ...]   # set any status: dispatched, rejected, …
 ```
+
+A recommendation moves through these statuses: `logged` (freshly
+surfaced) → `implemented` / `dispatched` (acted on) or `dismissed` /
+`rejected` (declined). `--reason` records *why* a rec was declined; the
+reason is written to the rec's frontmatter and the `events.jsonl` audit
+trail, and — importantly — fed back into the analyzer. Recently
+dismissed/rejected recs (with their reasons) are listed in the analyze
+prompt under "do not re-propose variants", and the write-time dedupe
+gate suppresses near-duplicates of them. So dismissing a rec with a
+reason like *"we don't want a background daemon"* stops the analyzer
+from re-proposing rephrasings of that idea.
 
 `day` and `week` are convenience presets — they set `--window`/`--meta`
 to the values the schedulers use. Either flag can override the preset

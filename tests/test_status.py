@@ -295,3 +295,168 @@ def test_set_status_invalid_value_raises(tmp_path: Path):
     seeded = _seed(conn, tmp_path / "recs")
     with pytest.raises(ValueError):
         recommend.set_status(conn, seeded[0].fingerprint, "frobnicated")
+
+
+def test_set_status_accepts_dispatched_and_rejected(tmp_path: Path):
+    conn = store.init(tmp_path / "u.sqlite")
+    seeded = _seed(conn, tmp_path / "recs")
+    d = recommend.set_status(conn, seeded[0].fingerprint, "dispatched")
+    assert d.new_status == "dispatched"
+    r = recommend.set_status(conn, seeded[1].fingerprint, "rejected")
+    assert r.new_status == "rejected"
+    statuses = {
+        row["id"]: row["status"]
+        for row in conn.execute("SELECT id, status FROM recommendations")
+    }
+    assert statuses[seeded[0].fingerprint] == "dispatched"
+    assert statuses[seeded[1].fingerprint] == "rejected"
+
+
+def test_set_status_persists_reason_to_db_and_frontmatter(tmp_path: Path):
+    conn = store.init(tmp_path / "u.sqlite")
+    seeded = _seed(conn, tmp_path / "recs")
+    target = seeded[0]
+
+    update = recommend.set_status(
+        conn, target.fingerprint, "rejected",
+        reason="signature is mis-framed; the real pattern is X",
+    )
+    assert update.reason == "signature is mis-framed; the real pattern is X"
+
+    row = conn.execute(
+        "SELECT status, reason FROM recommendations WHERE id = ?",
+        (target.fingerprint,),
+    ).fetchone()
+    assert row["status"] == "rejected"
+    assert row["reason"] == "signature is mis-framed; the real pattern is X"
+
+    fm = json.loads(
+        update.body_path.read_text().split("```\n", 2)[0].removeprefix("```json\n")
+    )
+    assert fm["status"] == "rejected"
+    assert fm["reason"] == "signature is mis-framed; the real pattern is X"
+
+
+def test_set_status_without_reason_leaves_existing_reason(tmp_path: Path):
+    """A plain status flip (reason=None) must not wipe a previously
+    recorded reason — the dispatch pipeline flips status first and records
+    the verdict separately, so a follow-up flip shouldn't clobber."""
+    conn = store.init(tmp_path / "u.sqlite")
+    seeded = _seed(conn, tmp_path / "recs")
+    target = seeded[0]
+
+    recommend.set_status(conn, target.fingerprint, "dismissed", reason="too niche")
+    recommend.set_status(conn, target.fingerprint, "logged")  # re-open, no reason
+
+    row = conn.execute(
+        "SELECT status, reason FROM recommendations WHERE id = ?",
+        (target.fingerprint,),
+    ).fetchone()
+    assert row["status"] == "logged"
+    assert row["reason"] == "too niche"
+
+
+def test_recent_dismissed_returns_negative_statuses_with_reasons(tmp_path: Path):
+    conn = store.init(tmp_path / "u.sqlite")
+    seeded = _seed(conn, tmp_path / "recs")
+    recommend.set_status(conn, seeded[0].fingerprint, "dismissed", reason="r1")
+    recommend.set_status(conn, seeded[1].fingerprint, "rejected", reason="r2")
+    # seeded[2] stays logged — must not appear.
+
+    rows = recommend.recent_dismissed(conn)
+    by_title = {r["title"]: r for r in rows}
+    assert set(by_title) == {"A", "B"}
+    assert by_title["A"]["reason"] == "r1"
+    assert by_title["B"]["reason"] == "r2"
+
+
+def test_render_dismissed_for_prompt_includes_reason():
+    rows = [
+        {"title": "Wrap rg", "signature": "rg <str>", "status": "dismissed",
+         "reason": "we don't want a wrapper"},
+        {"title": "Auto inbox", "signature": "loop <cmd>", "status": "rejected",
+         "reason": None},
+    ]
+    out = recommend.render_dismissed_for_prompt(rows)
+    assert "we don't want a wrapper" in out
+    assert "[dismissed] Wrap rg" in out
+    assert "[rejected] Auto inbox" in out
+    assert "(no reason given)" in out
+
+
+def test_render_dismissed_for_prompt_empty():
+    assert "no recently dismissed" in recommend.render_dismissed_for_prompt([])
+
+
+def test_recent_logged_includes_dispatched_excludes_negative(tmp_path: Path):
+    """recent_logged spans the active set (logged/implemented/dispatched)
+    and must exclude the negative statuses, which recent_dismissed owns."""
+    conn = store.init(tmp_path / "u.sqlite")
+    items = [
+        recommend.Recommendation(title="L", body_markdown="b", signature="s-l"),
+        recommend.Recommendation(title="D", body_markdown="b", signature="s-d"),
+        recommend.Recommendation(title="X", body_markdown="b", signature="s-x"),
+        recommend.Recommendation(title="R", body_markdown="b", signature="s-r"),
+    ]
+    fps = {}
+    for rec in items:
+        fps[rec.title] = recommend.write(
+            conn, rec, recs_dir=tmp_path / "recs"
+        ).fingerprint
+    recommend.set_status(conn, fps["D"], "dispatched")
+    recommend.set_status(conn, fps["X"], "dismissed", reason="no")
+    recommend.set_status(conn, fps["R"], "rejected", reason="mis-framed")
+    # "L" stays logged.
+
+    titles = {r["title"] for r in recommend.recent_logged(conn)}
+    assert titles == {"L", "D"}
+    assert "X" not in titles and "R" not in titles
+
+
+def test_recent_dismissed_filters_on_updated_at_not_created_at(tmp_path: Path):
+    """A rec created long ago but dismissed recently must appear (proves
+    updated_at filtering); a rec dismissed long ago must drop out."""
+    conn = store.init(tmp_path / "u.sqlite")
+    fresh = recommend.write(
+        conn,
+        recommend.Recommendation(title="Fresh", body_markdown="b", signature="s-f"),
+        recs_dir=tmp_path / "recs",
+    ).fingerprint
+    stale = recommend.write(
+        conn,
+        recommend.Recommendation(title="Stale", body_markdown="b", signature="s-s"),
+        recs_dir=tmp_path / "recs",
+    ).fingerprint
+
+    recommend.set_status(conn, fresh, "dismissed", reason="r")
+    recommend.set_status(conn, stale, "dismissed", reason="r")
+
+    long_ago = store.now_ms() - 90 * 86400 * 1000
+    # Fresh: created 90d ago, but dismissed (updated) just now → in window.
+    conn.execute(
+        "UPDATE recommendations SET created_at = ? WHERE id = ?", (long_ago, fresh)
+    )
+    # Stale: dismissed 90d ago → out of the 30-day window.
+    conn.execute(
+        "UPDATE recommendations SET updated_at = ? WHERE id = ?", (long_ago, stale)
+    )
+
+    titles = {r["title"] for r in recommend.recent_dismissed(conn)}
+    assert titles == {"Fresh"}
+
+
+def test_set_status_empty_reason_preserves_existing(tmp_path: Path):
+    """A blank --reason ("" or whitespace) is treated as no reason — it
+    must not clobber a previously recorded reason."""
+    conn = store.init(tmp_path / "u.sqlite")
+    seeded = _seed(conn, tmp_path / "recs")
+    target = seeded[0].fingerprint
+
+    recommend.set_status(conn, target, "dismissed", reason="real reason")
+    recommend.set_status(conn, target, "rejected", reason="   ")  # blank
+
+    row = conn.execute(
+        "SELECT status, reason FROM recommendations WHERE id = ?", (target,)
+    ).fetchone()
+    assert row["status"] == "rejected"
+    assert row["reason"] == "real reason"
