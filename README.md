@@ -87,6 +87,8 @@ undrudge list                # show recommendations
 undrudge dismiss <id> [--reason ...]    # mark a rec dismissed (full id or unique prefix)
 undrudge implement <id> [--reason ...]  # mark a rec implemented
 undrudge mark <id> <status> [--reason ...]   # set any status: dispatched, rejected, …
+undrudge dispatch run [--dry-run]    # route logged recs to repo clones as briefs (see below)
+undrudge dispatch status             # show logged recs + their dispatch state
 ```
 
 A recommendation moves through these statuses: `logged` (freshly
@@ -184,6 +186,36 @@ across 3 sessions this week. ...
 
 To dismiss: edit the frontmatter `status: dismissed`, or run `undrudge
 dismiss <id>`.
+
+## Dispatch (optional)
+
+`undrudge dispatch` is a deterministic courier — it moves paper, it
+doesn't think. It selects `logged` recs, gates and routes them to repo
+clones, writes a self-contained brief into each clone's
+`.undrudge-inbox/`, and reconciles the verdicts your sessions leave back
+into rec statuses. **Zero LLM calls** — an interactive Claude session
+(the global `/undrudge-check` command) does the triage; the dispatcher
+only shuffles files and flips statuses.
+
+The loop is pull-based and file-only, in the same spirit as the rest of
+undrudge:
+
+1. `dispatch run` writes `<clone>/.undrudge-inbox/<id12>.md` for each
+   routed rec and flips it to `dispatched` (so the analyzer treats it as
+   in-flight and won't re-propose it).
+2. A session triages the brief and drops a verdict —
+   `.undrudge-inbox/done/<id12>.verdict.json` with a disposition (`ship`
+   with a PR URL, `dismiss-stale`, `already-done`, `needs-human`, …).
+3. The next `dispatch run` reconciles: it flips statuses (always via the
+   same `set_status` path), polls open `ship` PRs to merge → `implemented`
+   or closed → `dismissed`, and surfaces anything needing a human in a
+   vault approval queue.
+
+Routing, gating, the daily cap, deny-list (shadow mode), and per-route
+clone behaviour are configured in a `[dispatch]` section of
+`config.toml`; see `prototype/config.example.json` for the shape.
+`--dry-run` computes and prints the whole report without writing a
+single brief, flipping a status, or touching the vault.
 
 ## Privacy
 

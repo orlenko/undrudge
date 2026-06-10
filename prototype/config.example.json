@@ -1,0 +1,101 @@
+{
+  "_comment": "SANITIZED example of the undrudge-dispatch config. The real config (~/.config/undrudge-dispatch/config.json) names sensitive internal projects and machine paths and is gitignored — this public repo only carries the shape. Routes map recommendations to recipient dirs: git routes WITHOUT an explicit 'dir' get a managed clone under clones_dir (cloned on demand, so triage never collides with a working checkout); an explicit 'dir' is the exception (a pinned existing clone, or a non-git/in-place target).",
+
+  "clones_dir": "/Users/you/code/undrudge-checks",
+
+  "vault_dir": "/Users/you/vault/agent-assisted",
+  "state_dir": "/Users/you/.local/share/undrudge-dispatch",
+  "undrudge_db": "/Users/you/.local/share/undrudge/undrudge.sqlite",
+  "undrudge_bin": "/Users/you/.local/bin/undrudge",
+  "events_file": "/Users/you/.local/share/undrudge/events.jsonl",
+  "gather_log": "/Users/you/.local/share/undrudge/logs/gather.log",
+  "a2a_pidfile": "/Users/you/.rationale/state/a2a-daemon.pid",
+  "cmux_bin": "/opt/homebrew/bin/cmux",
+  "gh_bin": "/opt/homebrew/bin/gh",
+  "git_bin": "/usr/bin/git",
+
+  "mirror_cmd": ["/usr/bin/rsync", "-a", "--delete-excluded",
+    "/Users/you/.local/share/undrudge/recommendations/",
+    "/Users/you/vault/agent-assisted/undrudge/recommendations/"],
+
+  "apply_denylist": false,
+  "_comment_denylist": "false = shadow mode: deny-list matches are reported only, recs flow normally. Flip to true to enact.",
+  "deny_patterns": [
+    "\\bretired-stack\\b",
+    "(rat:inbox|\\ba2a\\b).{0,50}(loop|schedul|cron|auto|watcher|poll)"
+  ],
+
+  "similarity_threshold": 0.85,
+  "similarity_min_sig_len": 25,
+
+  "gate_confidence": ["high", "medium"],
+  "gate_forms": ["extend_existing", "script", "slash_command"],
+  "max_dispatch_per_run": 6,
+
+  "staging": "cmux",
+  "pretyped_cmd": "safe-claude \"/undrudge-check\"",
+  "osascript_notify": true,
+
+  "routes": [
+    {
+      "name": "pinned-repo",
+      "_comment": "exception: a pinned existing clone instead of a managed one (e.g. a large monorepo already synced)",
+      "dir": "/Users/you/code2/pinned-repo",
+      "origins": ["github.com/your-org/pinned-repo"],
+      "cwd_prefixes": ["/Users/you/code/pinned-repo", "/Users/you/code2/pinned-repo"],
+      "auto": true,
+      "sync": ["fetch", "switch:develop", "pull"],
+      "stage": "cmux"
+    },
+    {
+      "name": "managed-repo",
+      "_comment": "no 'dir' -> managed clone at <clones_dir>/managed-repo, cloned on demand",
+      "clone_url": "https://github.com/your-org/managed-repo.git",
+      "branch": "develop",
+      "origins": ["github.com/your-org/managed-repo"],
+      "cwd_prefixes": ["/Users/you/code/managed-repo"],
+      "auto": true,
+      "stage": "cmux"
+    },
+    {
+      "name": "approval-only-repo",
+      "_comment": "auto=false -> always held for human approval in the vault queue",
+      "clone_url": "https://github.com/your-org/approval-only-repo.git",
+      "branch": "main",
+      "origins": ["github.com/your-org/approval-only-repo"],
+      "cwd_prefixes": ["/Users/you/code/approval-only-repo"],
+      "auto": false,
+      "stage": "cmux"
+    },
+    {
+      "name": "in-place-private",
+      "_comment": "non-git / sensitive / local-only: explicit dir, no sync; implemented in place",
+      "dir": "/Users/you/personal/in-place-private",
+      "origins": [],
+      "cwd_prefixes": ["/Users/you/personal/in-place-private"],
+      "auto": true,
+      "sync": null,
+      "stage": "cmux"
+    },
+    {
+      "name": "vault",
+      "_comment": "agent_global recs land here; the devlog session handles them via /undrudge-queue",
+      "dir": "/Users/you/vault/agent-assisted",
+      "origins": [],
+      "cwd_prefixes": ["/Users/you/vault/agent-assisted"],
+      "auto": true,
+      "sync": null,
+      "stage": "notify"
+    },
+    {
+      "name": "held-sensitive",
+      "_comment": "sensitive zone: hold for approval, never stage",
+      "dir": "/Users/you/personal/held-sensitive",
+      "origins": [],
+      "cwd_prefixes": ["/Users/you/personal/held-sensitive"],
+      "auto": false,
+      "sync": null,
+      "stage": "none"
+    }
+  ]
+}

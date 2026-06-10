@@ -540,6 +540,12 @@ def _cmd_gather(_args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+def _cmd_dispatch(args: argparse.Namespace) -> int:
+    from . import dispatch_run
+    cfg = config.load()
+    return dispatch_run.cmd_dispatch(cfg, subcmd=args.subcmd, dry=args.dry_run)
+
+
 def _cmd_scrub(args: argparse.Namespace) -> int:
     """Re-apply current secret redaction over stored command text.
 
@@ -587,6 +593,22 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_gather = sub.add_parser("gather", help="Ingest Claude + shell activity.")
     p_gather.set_defaults(func=_cmd_gather)
+
+    p_dispatch = sub.add_parser(
+        "dispatch",
+        help="Route logged recs to repo clones as briefs (needs a "
+             "[dispatch] config section).",
+    )
+    p_dispatch.add_argument(
+        "subcmd", nargs="?", default="run", choices=["run", "status"],
+        help="run = dispatch + reconcile (default); status = show logged recs.",
+    )
+    p_dispatch.add_argument(
+        "--dry-run", action="store_true",
+        help="Compute and print the report without writing briefs, "
+             "flipping statuses, or touching the vault.",
+    )
+    p_dispatch.set_defaults(func=_cmd_dispatch)
 
     p_scrub = sub.add_parser(
         "scrub",
