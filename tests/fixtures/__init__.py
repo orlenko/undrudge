@@ -44,6 +44,10 @@ def _slack_bot() -> str:
     return "xoxb" + "-1234567890-" + "AbCdEfGhIjKlMnOpQrStUvWxYz"
 
 
+def _linear_key() -> str:
+    return "lin" + "_api_" + "a1B2c3D4e5F6g7H8i9J0" * 2
+
+
 def _jwt() -> str:
     head = "eyJ" + "hbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
     payload = "eyJ" + "zdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkphbmUgRG9lIn0"
@@ -95,6 +99,7 @@ def planted_secrets() -> list[tuple[str, str]]:
         ("github-pat",         _github_pat()),
         ("anthropic",          _anthropic_key()),
         ("openai",             _openai_key()),
+        ("linear",             _linear_key()),
         ("slack-bot",          _slack_bot()),
         ("jwt",                _jwt()),
         ("bearer",             _bearer()),

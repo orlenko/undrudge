@@ -57,6 +57,11 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("github-fine-grained-token", re.compile(r"\b(github_pat_[A-Za-z0-9_]{22,})\b")),
     ("anthropic-key", re.compile(r"\b(sk-ant-[A-Za-z0-9_\-]{20,})\b")),
     ("openai-key", re.compile(r"\b(sk-[A-Za-z0-9]{20,})\b")),
+    # Linear API keys: lin_api_ + a long alphanumeric body. The trailing
+    # `_` of the prefix is a word char, so the generic 40-char base64
+    # catch-all never word-boundaries onto the body — without this
+    # explicit pattern `lin_api_...` slips through ingest entirely.
+    ("linear-api-key", re.compile(r"\b(lin_api_[A-Za-z0-9]{20,})\b")),
     ("slack-token", re.compile(r"\b(xox[boaprs]-[A-Za-z0-9-]{10,})\b")),
     (
         "jwt",
