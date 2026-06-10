@@ -18,3 +18,7 @@ build/
 # instead. The live config lives at ~/.config/undrudge-dispatch/.
 prototype/config.json
 prototype/undrudge.dispatch.plist
+
+# Per-machine a2a/rationale messaging command copies — not undrudge
+# project files. Live locally only.
+.claude/commands/rat/
