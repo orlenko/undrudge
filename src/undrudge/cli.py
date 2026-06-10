@@ -145,12 +145,18 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
 
 
 def _check_gather_health(cfg: config.Config, check) -> None:
-    """Surface recent gather failures from events.jsonl.
+    """Report gather health from events.jsonl, keyed off the *latest* run.
 
     Silent hourly failure is how the atuin WAL race went unnoticed for
-    weeks. Doctor now scans events.jsonl for ``gather_failed`` events
-    in the last 24h and flags any it finds, with the most recent
-    error_type so the operator can grep.
+    weeks, so doctor must surface a *currently broken* gather. But it must
+    not cry wolf: the atuin read can transiently fail (WAL-open race) and
+    self-heal on the next hourly run, so flagging any failure in a 24h
+    window paints every morning red after one overnight blip — training
+    the operator to ignore the check.
+
+    So: FAIL only when the most recent ``gather_complete`` shows a source
+    still failing. Transient failures that a later run recovered are
+    reported as an informational note, not a FAIL.
     """
     log = cfg.paths.events_log
     if not log.exists():
@@ -159,7 +165,8 @@ def _check_gather_health(cfg: config.Config, check) -> None:
         return
 
     cutoff_ms = store.now_ms() - 24 * 3600 * 1000
-    recent: list[dict] = []
+    last_complete: dict | None = None
+    transient_failures = 0
     try:
         with log.open(encoding="utf-8") as fp:
             for line in fp:
@@ -167,30 +174,42 @@ def _check_gather_health(cfg: config.Config, check) -> None:
                     e = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if (
-                    e.get("event") == "gather_failed"
-                    and e.get("ts", 0) >= cutoff_ms
-                ):
-                    recent.append(e)
+                if e.get("ts", 0) < cutoff_ms:
+                    continue
+                event = e.get("event")
+                if event == "gather_complete":
+                    last_complete = e
+                elif event == "gather_failed":
+                    transient_failures += 1
     except OSError as e:
         check("events log readable", False, str(e))
         return
 
-    if not recent:
-        check("no gather failures in last 24h", True, str(log))
+    # Old DBs predate gather_complete: fall back to "any failure in 24h"
+    # rather than claim health we can't prove.
+    if last_complete is None:
+        if transient_failures:
+            check("last gather run healthy", False,
+                  f"{transient_failures} failure(s) in 24h; "
+                  f"no gather_complete event yet (pre-upgrade gather)")
+        else:
+            check("last gather run healthy", True,
+                  "no failures in 24h (no gather_complete event yet)")
         return
 
-    by_source: dict[str, int] = {}
-    for e in recent:
-        by_source[e.get("source", "?")] = by_source.get(e.get("source", "?"), 0) + 1
-    last = recent[-1]
-    breakdown = ", ".join(f"{s}={n}" for s, n in sorted(by_source.items()))
-    detail = (
-        f"{len(recent)} failure(s) ({breakdown}); "
-        f"last: {last.get('source')} {last.get('error_type')}: "
-        f"{(last.get('error_msg') or '')[:120]}"
-    )
-    check("no gather failures in last 24h", False, detail)
+    failed_now = last_complete.get("failed_sources") or []
+    if failed_now:
+        check("last gather run healthy", False,
+              f"latest run still failing: {', '.join(failed_now)}")
+        return
+
+    # Latest run was clean. Note any self-healed transients as info, not FAIL.
+    if transient_failures:
+        check("last gather run healthy", True,
+              f"clean — but {transient_failures} transient failure(s) in 24h "
+              f"self-healed (likely atuin WAL-open race)")
+    else:
+        check("last gather run healthy", True, "clean")
 
 
 def _placeholder(name: str):
@@ -503,6 +522,20 @@ def _cmd_gather(_args: argparse.Namespace) -> int:
                 "error_msg": str(exc),
             },
         )
+
+    # One terminal event per run with the per-source outcome. doctor reads
+    # the *latest* gather_complete to decide health, so a transient failure
+    # that self-heals on the next run no longer shows as a standing FAIL —
+    # only a currently-broken source does.
+    events.record(
+        cfg.paths.events_log,
+        "gather_complete",
+        {
+            "failed_sources": [src for src, _ in failures],
+            "shell_rows": s.rows_inserted if s is not None else None,
+            "claude_rows": c.rows_inserted if c is not None else None,
+        },
+    )
     return 1 if failures else 0
 
 
