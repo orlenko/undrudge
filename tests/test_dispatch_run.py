@@ -155,11 +155,12 @@ def test_load_config_prefers_dispatch_toml(tmp_path: Path):
     )
     proto = tmp_path / "config.json"
     proto.write_text(json.dumps({"clones_dir": "/x", "routes": [{"name": "r-json"}]}))
-    cfg = dispatch_run.load_dispatch_config(
+    cfg, source = dispatch_run.load_dispatch_config(
         _ucfg_min(tmp_path), config_toml_path=toml, prototype_json_path=str(proto))
     assert cfg is not None
     assert cfg.clones_dir == "/c"
     assert cfg.routes[0].name == "r-toml"  # TOML wins over the JSON fallback
+    assert "[dispatch]" in source
 
 
 def test_load_config_falls_back_to_prototype_json(tmp_path: Path):
@@ -168,16 +169,18 @@ def test_load_config_falls_back_to_prototype_json(tmp_path: Path):
     proto = tmp_path / "config.json"
     proto.write_text(json.dumps(
         {"clones_dir": "/c2", "routes": [{"name": "r2", "dir": "/d2"}]}))
-    cfg = dispatch_run.load_dispatch_config(
+    cfg, source = dispatch_run.load_dispatch_config(
         _ucfg_min(tmp_path), config_toml_path=toml, prototype_json_path=str(proto))
     assert cfg is not None
     assert cfg.clones_dir == "/c2"
     assert cfg.routes[0].name == "r2"
+    assert "prototype fallback" in source
 
 
 def test_load_config_none_when_unconfigured(tmp_path: Path):
-    cfg = dispatch_run.load_dispatch_config(
+    cfg, source = dispatch_run.load_dispatch_config(
         _ucfg_min(tmp_path),
         config_toml_path=tmp_path / "missing.toml",
         prototype_json_path=str(tmp_path / "missing.json"))
     assert cfg is None
+    assert source == ""

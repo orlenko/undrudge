@@ -550,13 +550,15 @@ def load_dispatch_config(
     *,
     config_toml_path: Path | None = None,
     prototype_json_path: str | None = None,
-) -> dispatch.DispatchConfig | None:
-    """Resolve the dispatch config.
+) -> tuple[dispatch.DispatchConfig | None, str]:
+    """Resolve the dispatch config and report where it came from.
 
     Prefers a ``[dispatch]`` table in undrudge's own config.toml. Failing
     that, falls back to the standalone prototype's ``config.json`` so the
-    two tools share config while they coexist. Returns ``None`` if neither
-    is configured.
+    two tools share config while they coexist. Returns
+    ``(config, source)``; ``(None, "")`` if neither is configured. The
+    ``source`` string is surfaced so a run is unambiguous about what it
+    ran against.
     """
     import tomllib
 
@@ -567,24 +569,26 @@ def load_dispatch_config(
         except (OSError, tomllib.TOMLDecodeError):
             table = None
         if table:
-            return dispatch.DispatchConfig.from_dict(table)
+            return dispatch.DispatchConfig.from_dict(table), f"{toml_path} [dispatch]"
 
     proto = Path(prototype_json_path or PROTOTYPE_CONFIG_PATH)
     if proto.exists():
         try:
             data = json.loads(proto.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return None
-        return dispatch.DispatchConfig.from_dict(data)
-    return None
+            return None, ""
+        return dispatch.DispatchConfig.from_dict(data), f"{proto} (prototype fallback)"
+    return None, ""
 
 
 def cmd_dispatch(ucfg: cfg_mod.Config, *, subcmd: str, dry: bool) -> int:
-    dcfg = load_dispatch_config(ucfg)
+    dcfg, source = load_dispatch_config(ucfg)
     if dcfg is None:
         print("dispatch not configured: add a [dispatch] section to "
-              f"{cfg_mod.default_config_path()}", file=sys.stderr)
+              f"{cfg_mod.default_config_path()} (or keep "
+              f"{PROTOTYPE_CONFIG_PATH})", file=sys.stderr)
         return 2
+    print(f"config: {source}{' (dry-run)' if dry else ''}")
     conn = store.open_db(ucfg.paths.db)
     try:
         store.apply_schema(conn)
