@@ -110,6 +110,11 @@ class FileBasedInvoker:
     workdir: Path
     timeout: int = DEFAULT_TIMEOUT
     poll_interval: float = 2.0
+    # Teardown grace: SIGTERM then, if the child ignores it, SIGKILL.
+    # A child can ignore SIGTERM when wedged in an interactive nono prompt
+    # after writing its marker — see _reap.
+    term_wait: float = 5.0
+    kill_wait: float = 5.0
 
     def __call__(self, prompt: str) -> str:
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -162,13 +167,22 @@ class FileBasedInvoker:
                             "claude pid=%d wrote marker after %.1fs",
                             proc.pid, elapsed,
                         )
-                        try:
-                            proc.wait(timeout=10)
-                        except subprocess.TimeoutExpired:
-                            proc.terminate()
-                            proc.wait(timeout=5)
-                        if response_file.exists():
-                            return response_file.read_text()
+                        # Capture the result BEFORE reaping the child.
+                        # claude writes response.txt and *then* the marker,
+                        # so a present marker means the response is on disk
+                        # — even if claude is still alive, e.g. blocked on
+                        # an interactive nono "review denied paths" prompt
+                        # that only appears post-run and that nobody answers
+                        # in a headless invocation. A hung child must never
+                        # discard a run that already succeeded.
+                        response = (
+                            response_file.read_text()
+                            if response_file.exists() else None
+                        )
+                        _reap(proc, term_wait=self.term_wait,
+                              kill_wait=self.kill_wait)
+                        if response is not None:
+                            return response
                         raise RuntimeError(
                             f"marker present but no response file at {response_file}"
                         )
@@ -194,16 +208,43 @@ class FileBasedInvoker:
                     )
                     time.sleep(self.poll_interval)
             finally:
-                if proc.poll() is None:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
+                _reap(proc, term_wait=self.term_wait, kill_wait=self.kill_wait)
 
         raise TimeoutError(
             f"claude did not finish in {self.timeout}s; workdir={self.workdir}"
         )
+
+
+def _reap(
+    proc: subprocess.Popen, *, term_wait: float = 5.0, kill_wait: float = 5.0
+) -> None:
+    """Best-effort teardown of the claude child. Never raises.
+
+    The child can outlive its marker: claude writes ``response.txt`` and
+    ``done.marker`` and *then*, instead of exiting, can block on an
+    interactive nono "review denied paths" prompt that nobody will answer
+    in a headless ``-p`` run. SIGTERM may not reap it promptly, so we
+    escalate to SIGKILL — and swallow every error. By the time we reap,
+    the caller has already captured the authoritative result from
+    ``response.txt``, so teardown must never turn a successful run into a
+    crash. The bug this guards against: an unwrapped ``proc.wait`` raising
+    ``TimeoutExpired`` and discarding a finished analysis.
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=term_wait)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except OSError:
+        return
+    try:
+        proc.kill()
+        proc.wait(timeout=kill_wait)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
 
 
 def _tail(path: Path, n_chars: int) -> str:

@@ -632,3 +632,75 @@ def test_run_handles_malformed_response(tmp_path: Path):
     conn = store.init(cfg.paths.db)
     with pytest.raises(ValueError):
         analyze.run(conn, cfg, invoker=lambda _: "not even close to json")
+
+
+# --------------------------------------------------------------------------
+# Invoker teardown: a child that lingers after the marker must not crash the
+# run nor discard its result. Regression for the real-world failure where
+# claude wrote response.txt + done.marker, then blocked on an interactive
+# nono prompt that ignored SIGTERM — the old unwrapped proc.wait raised and
+# threw away a finished 222s analysis.
+# --------------------------------------------------------------------------
+
+
+def test_invoker_returns_result_when_child_ignores_sigterm_after_marker(
+    tmp_path: Path,
+):
+    """The exact bug: marker + response written, then the child traps
+    SIGTERM and keeps running. The invoker must capture the response,
+    escalate to SIGKILL, and return — not crash, not lose the result."""
+    wd = tmp_path / "wd"
+    fake_claude = tmp_path / "linger.sh"
+    payload = '[{"title": "ok", "signature": "sig", "body_markdown": "b"}]'
+    fake_claude.write_text(
+        "#!/usr/bin/env bash\n"
+        "trap '' TERM\n"               # ignore SIGTERM, like the wedged TUI
+        f'cat > "{wd}/response.txt" <<\'EOF\'\n'
+        f"{payload}\n"
+        "EOF\n"
+        f'touch "{wd}/done.marker"\n'
+        "sleep 60\n"                    # linger; only SIGKILL ends this
+    )
+    fake_claude.chmod(0o755)
+
+    invoker = analyze.FileBasedInvoker(
+        command_argv=[str(fake_claude)],
+        workdir=wd,
+        timeout=30,
+        poll_interval=0.05,
+        term_wait=0.3,   # don't wait the full 5s for the ignored SIGTERM
+        kill_wait=3.0,
+    )
+    out = invoker("hello prompt")
+    assert payload in out
+
+
+def test_reap_escalates_to_sigkill(tmp_path: Path):
+    """_reap kills a SIGTERM-ignoring child and never raises."""
+    import subprocess
+    import sys
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c",
+         "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+         "print('up', flush=True); time.sleep(60)"],
+        stdout=subprocess.DEVNULL,
+    )
+    try:
+        analyze._reap(proc, term_wait=0.3, kill_wait=5.0)
+        assert proc.poll() is not None  # reaped
+    finally:
+        if proc.poll() is None:  # safety net if the assert above failed
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def test_reap_is_noop_on_already_dead_process(tmp_path: Path):
+    import subprocess
+    import sys
+
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait(timeout=5)
+    # Must return cleanly without raising on an already-exited child.
+    analyze._reap(proc, term_wait=0.1, kill_wait=0.1)
+    assert proc.poll() is not None
