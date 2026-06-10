@@ -593,3 +593,180 @@ def reconcile(
             rep.pending_prs.append(f"{rid} {artifact} (open)")
 
     return rep
+
+
+# --------------------------------------------------------------------------
+# Output rendering — pure string builders (the orchestration writes them)
+# --------------------------------------------------------------------------
+
+
+def render_brief(
+    *,
+    id12: str,
+    title: str,
+    body: str,
+    cwds: list[str],
+    fm: dict[str, Any],
+    route_name: str,
+    route_dir: str,
+    branch: str,
+    gitlog: str,
+    prs: str,
+    today: str,
+) -> str:
+    """The self-contained brief written to ``<clone>/.undrudge-inbox/<id12>.md``.
+
+    Verbatim-faithful to the prototype: it carries the recommendation, the
+    resolved evidence locations, a staleness snapshot (recent commits +
+    merged PRs), and the triage contract the ``/undrudge-check`` session
+    follows. No LLM touches this — it's pure paper.
+    """
+    ev = "\n".join(f"- {c}" for c in cwds[:6]) or "- (no evidence cwds resolved)"
+    return f"""# undrudge brief — {id12} — {title}
+
+Generated {today} by undrudge dispatch (deterministic courier — no LLM touched this).
+Target: {route_dir} (route `{route_name}`) · confidence **{fm.get("confidence", "?")}** \
+· form **{fm.get("automation_form", "?")}** · scope {fm.get("target_scope", "?")}
+
+## Recommendation (verbatim)
+
+{body.strip()}
+
+## Resolved evidence locations (from the undrudge DB)
+
+{ev}
+
+## Recent activity here (staleness check — recs lag the codebase by 2–4 weeks)
+
+Branch: `{branch}`
+
+```
+{gitlog or "(quiet)"}
+```
+
+Recently merged PRs:
+
+```
+{prs or "(gh unavailable or no recent merges)"}
+```
+
+## Triage contract
+
+Verify before building (rec evidence can be hallucinated or stale):
+1. Cited files/commands/paths exist in THIS tree.
+2. The pain is steady-state, not a one-off burst that already ended (check evidence dates).
+3. Not already solved (check the git log / merged PRs above).
+
+Dispositions — when decided, write `done/{id12}.verdict.json`
+`{{"id": "{id12}", "disposition": "...", "reason": "...", "artifact": "<full PR URL or null>"}}`
+and move this brief into `done/`:
+- **ship** — open a draft PR; artifact MUST be the full PR URL; do NOT flip the
+  undrudge status — the dispatcher implements it when the PR merges.
+- **dismiss-stale** / **reject-as-framed** — the dispatcher dismisses on reconcile.
+- **already-done** — the dispatcher marks it implemented.
+- **convert-to-task** / **needs-human** — verdict only; surfaces in the vault queue.
+
+The global `/undrudge-check` command knows this whole procedure.
+"""
+
+
+def _classify_hold(why: str) -> str:
+    if why.startswith("verdict"):
+        return "Needs human (session verdicts)"
+    if why.startswith("cross_cutting") or why.startswith("no route"):
+        return "Routing needed — repo, dotfiles, or personal habit?"
+    if "approval-only" in why:
+        return "Approval-only routes"
+    if why.startswith("gate:"):
+        return "Below the auto-gate (often personal/process suggestions)"
+    if "similar to dismissed" in why:
+        return "Probable repeats of dismissed recs"
+    return "Deferred (will retry on a later run)"
+
+
+_QUEUE_SECTION_ORDER = (
+    "Needs human (session verdicts)",
+    "Routing needed — repo, dotfiles, or personal habit?",
+    "Below the auto-gate (often personal/process suggestions)",
+    "Probable repeats of dismissed recs",
+    "Approval-only routes",
+    "Deferred (will retry on a later run)",
+)
+
+
+def render_queue(holds: list[tuple[dict[str, Any], str]], *, route_names: str) -> str:
+    """The vault dispatch-queue.md — held recs grouped for human triage,
+    each with the checkbox grammar the next run reads (invariant #3)."""
+    sections: dict[str, list[tuple[dict, str]]] = {}
+    for rec, why in holds:
+        sections.setdefault(_classify_hold(why), []).append((rec, why))
+
+    lines = [
+        "# undrudge dispatch queue", "",
+        "Best UX: open the devlog session and run `/undrudge-queue` to triage these",
+        "conversationally. Checkbox fallback — the next dispatcher run acts on ticked",
+        "boxes: `- [x] approve <id>` dispatches despite the gate (add `-> <route>` to",
+        f"name the target: {route_names}) · `- [x] dismiss <id> — reason: ...` dismisses.",
+        "",
+    ]
+    for title in _QUEUE_SECTION_ORDER:
+        if title not in sections:
+            continue
+        lines.append(f"## {title}")
+        lines.append("")
+        for rec, why in sections[title]:
+            fm = rec.get("fm", {})
+            lines.append(f"### {rec['id12']} — {rec.get('title', '')}")
+            lines.append(
+                f"*{why}* · confidence {fm.get('confidence', '?')} "
+                f"· form {fm.get('automation_form', '?')} "
+                f"· scope {fm.get('target_scope', '?')}"
+            )
+            lines.append(f"`undrudge show {rec['id12']}`")
+            needs_route = why.startswith("cross_cutting") or why.startswith("no route")
+            lines.append(f"- [ ] approve {rec['id12']}{' -> ' if needs_route else ''}")
+            lines.append(f"- [ ] dismiss {rec['id12']} — reason: ")
+            lines.append("")
+    if not holds:
+        lines.append("_Queue empty._")
+    return "\n".join(lines) + "\n"
+
+
+def render_report(
+    report: dict[str, list[str]],
+    staging_notes: list[str],
+    *,
+    now_hm: str,
+    dry: bool,
+    apply_denylist: bool,
+) -> str:
+    """One run's section for the append-only daily dispatch-log."""
+    lines = ["", f"## run @ {now_hm}{' (dry)' if dry else ''}", ""]
+
+    def section(title: str, items: list[str], empty: str = "none") -> None:
+        lines.append(f"### {title}")
+        if items:
+            lines.extend(f"- {i}" for i in items)
+        else:
+            lines.append(f"- _{empty}_")
+        lines.append("")
+
+    section("Dispatched", report.get("dispatched", []))
+    section("Staging", staging_notes)
+    section("Held for approval (see dispatch-queue.md)", report.get("held", []))
+    if apply_denylist:
+        section("Auto-dismissed (deny-list)", report.get("auto_dismissed", []))
+    else:
+        section(
+            "Deny-list matches (SHADOW MODE — flowing normally; "
+            "flip apply_denylist to enact)",
+            report.get("would_dismiss", []),
+        )
+    section("Verdicts collected", report.get("verdicts", []))
+    section("Completed since last run", report.get("completed", []))
+    section("Draft PRs awaiting review", report.get("pending_prs", []))
+    section("Approvals processed", report.get("approvals", []))
+    section("Routing notes", report.get("notes", []))
+    section("Failures", report.get("failures", []), empty="none 🎉")
+    section("Health", report.get("health", []))
+    return "\n".join(lines)

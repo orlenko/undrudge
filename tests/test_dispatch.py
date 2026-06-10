@@ -433,3 +433,81 @@ def test_from_dict_minimal_defaults():
     assert cfg.gate_confidence == ("high", "medium")
     assert cfg.git_bin == "git"
     assert cfg.apply_denylist is False
+
+
+# --------------------------------------------------------------------------
+# Renderers
+# --------------------------------------------------------------------------
+
+
+def test_render_brief_has_recommendation_evidence_and_contract():
+    out = dispatch.render_brief(
+        id12="abc123def456", title="Wrap find/grep",
+        body="You ran the same find|grep 7 times.", cwds=["/repo/a", "/repo/b"],
+        fm={"confidence": "high", "automation_form": "script", "target_scope": "single_repo"},
+        route_name="ops", route_dir="/clones/ops", branch="develop",
+        gitlog="abc fix thing", prs="#12 merged", today="2026-06-10",
+    )
+    assert "Wrap find/grep" in out
+    assert "You ran the same find|grep 7 times." in out
+    assert "/repo/a" in out
+    assert "develop" in out
+    assert "confidence **high**" in out
+    # The verdict-file contract names this rec's id.
+    assert "done/abc123def456.verdict.json" in out
+    assert "ship" in out and "needs-human" in out
+
+
+def test_render_brief_handles_no_evidence_cwds():
+    out = dispatch.render_brief(
+        id12="x", title="t", body="b", cwds=[], fm={},
+        route_name="r", route_dir="/d", branch="main", gitlog="", prs="", today="d",
+    )
+    assert "(no evidence cwds resolved)" in out
+    assert "(quiet)" in out
+
+
+def test_render_queue_groups_and_emits_checkboxes():
+    holds = [
+        ({"id12": "aaa111", "title": "A", "fm": {"confidence": "low"}},
+         "gate: confidence=low form=other"),
+        ({"id12": "bbb222", "title": "B", "fm": {}},
+         "cross_cutting scope — needs a human routing decision"),
+    ]
+    out = dispatch.render_queue(holds, route_names="ops, vault")
+    assert "Below the auto-gate" in out
+    assert "Routing needed" in out
+    assert "- [ ] approve aaa111" in out
+    assert "- [ ] dismiss bbb222 — reason:" in out
+    # cross_cutting hold invites a route after approve.
+    assert "- [ ] approve bbb222 ->" in out
+
+
+def test_render_queue_empty():
+    assert "_Queue empty._" in dispatch.render_queue([], route_names="ops")
+
+
+def test_render_report_sections_and_dry_marker():
+    report = {
+        "dispatched": ["x -> ops"], "held": [], "would_dismiss": ["y (pattern foo)"],
+        "failures": [], "health": ["gather: healthy"],
+    }
+    out = dispatch.render_report(
+        report, ["ops: staged"], now_hm="07:00", dry=True, apply_denylist=False,
+    )
+    assert "## run @ 07:00 (dry)" in out
+    assert "x -> ops" in out
+    assert "SHADOW MODE" in out          # apply_denylist False
+    assert "would_dismiss" not in out    # rendered as the shadow section, not raw key
+    assert "y (pattern foo)" in out
+    assert "none 🎉" in out               # empty failures
+
+
+def test_render_report_apply_denylist_uses_auto_dismissed_section():
+    report = {"auto_dismissed": ["z killed"]}
+    out = dispatch.render_report(
+        report, [], now_hm="07:00", dry=False, apply_denylist=True,
+    )
+    assert "Auto-dismissed (deny-list)" in out
+    assert "z killed" in out
+    assert "SHADOW MODE" not in out
