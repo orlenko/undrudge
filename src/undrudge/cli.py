@@ -21,6 +21,7 @@ from . import (
     ingest_shell,
     llm,
     recommend,
+    scrub,
     store,
 )
 
@@ -545,6 +546,32 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     return dispatch_run.cmd_dispatch(cfg, subcmd=args.subcmd, dry=args.dry_run)
 
 
+def _cmd_scrub(args: argparse.Namespace) -> int:
+    """Re-apply current secret redaction over stored command text.
+
+    Run after adding a secret pattern to the sanitizer so rows ingested
+    before the pattern existed get cleaned without a re-ingest.
+    """
+    cfg = config.load()
+    conn = store.open_db(cfg.paths.db)
+    try:
+        store.apply_schema(conn)
+        stats = scrub.rescan_commands(conn, dry_run=args.dry_run)
+    finally:
+        conn.close()
+
+    suffix = " (dry-run, not written)" if args.dry_run else ""
+    print(f"commands scanned   : {stats.scanned}")
+    print(f"commands rewritten : {stats.changed}{suffix}")
+    if stats.changed and not args.dry_run:
+        events.record(
+            cfg.paths.events_log,
+            "scrub_complete",
+            {"commands_changed": stats.changed, "commands_scanned": stats.scanned},
+        )
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="undrudge",
@@ -582,6 +609,17 @@ def _build_parser() -> argparse.ArgumentParser:
              "flipping statuses, or touching the vault.",
     )
     p_dispatch.set_defaults(func=_cmd_dispatch)
+
+    p_scrub = sub.add_parser(
+        "scrub",
+        help="Re-apply secret redaction to stored command text "
+             "(run after adding a sanitizer pattern).",
+    )
+    p_scrub.add_argument(
+        "--dry-run", action="store_true",
+        help="Report how many rows would change; don't write.",
+    )
+    p_scrub.set_defaults(func=_cmd_scrub)
 
     p_digest = sub.add_parser(
         "digest", help="Render activity digest for inspection or LLM input.",
