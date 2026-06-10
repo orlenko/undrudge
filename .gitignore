@@ -11,3 +11,10 @@ build/
 *.egg-info/
 .a2a/
 .DS_Store
+
+# The real dispatch prototype config + plist name sensitive internal
+# projects (and a live legal matter) and machine paths — never commit
+# them to this public repo. A sanitized config.example.json is vendored
+# instead. The live config lives at ~/.config/undrudge-dispatch/.
+prototype/config.json
+prototype/undrudge.dispatch.plist

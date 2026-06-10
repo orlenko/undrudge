@@ -7,8 +7,15 @@ gating, dismissal similarity, and the approval-queue grammar (#3).
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from undrudge import dispatch
 from undrudge.dispatch import DispatchConfig, Route
+
+_EXAMPLE_CONFIG = (
+    Path(__file__).resolve().parent.parent / "prototype" / "config.example.json"
+)
 
 
 def _cfg(**kw) -> DispatchConfig:
@@ -386,3 +393,43 @@ def test_collect_verdict_files_from_done_and_spool():
     )
     got = {(v.route_name, v.data["disposition"]) for v in out}
     assert got == {("ops", "ship"), ("spool", "dismiss-stale")}
+
+
+# --------------------------------------------------------------------------
+# DispatchConfig.from_dict
+# --------------------------------------------------------------------------
+
+
+def test_from_dict_parses_the_sanitized_example():
+    data = json.loads(_EXAMPLE_CONFIG.read_text())
+    cfg = DispatchConfig.from_dict(data)
+
+    assert cfg.clones_dir.endswith("/undrudge-checks")
+    assert cfg.gate_confidence == ("high", "medium")
+    assert cfg.apply_denylist is False
+    assert cfg.similarity_min_sig_len == 25
+    assert cfg.max_dispatch_per_run == 6
+    assert cfg.mirror_cmd[0].endswith("rsync")
+
+    routes = {r.name: r for r in cfg.routes}
+    # Managed clone: no explicit dir -> materialized under clones_dir + sync.
+    mr = routes["managed-repo"]
+    assert mr.managed_clone is True
+    assert mr.dir == f"{cfg.clones_dir}/managed-repo"
+    assert mr.sync == ["fetch", "switch:develop", "pull"]
+    # Pinned dir: explicit, untouched, not a managed clone.
+    pr = routes["pinned-repo"]
+    assert pr.managed_clone is False
+    assert pr.dir.endswith("/code2/pinned-repo")
+    # Gating + staging flags carried through.
+    assert routes["approval-only-repo"].auto is False
+    assert routes["held-sensitive"].stage == "none"
+    assert routes["vault"].stage == "notify"
+
+
+def test_from_dict_minimal_defaults():
+    cfg = DispatchConfig.from_dict({"routes": []})
+    assert cfg.routes == []
+    assert cfg.gate_confidence == ("high", "medium")
+    assert cfg.git_bin == "git"
+    assert cfg.apply_denylist is False

@@ -87,6 +87,57 @@ class DispatchConfig:
     similarity_threshold: float = recommend.SIGNATURE_SIMILARITY_THRESHOLD
     similarity_min_sig_len: int = 12
     max_dispatch_per_run: int = 6
+    # Filesystem destinations + courier state (I/O layer, stage 3).
+    vault_dir: str = ""
+    state_dir: str = ""
+    # External tools.
+    git_bin: str = "git"
+    gh_bin: str = "gh"
+    cmux_bin: str = "cmux"
+    a2a_pidfile: str = ""
+    mirror_cmd: list[str] = field(default_factory=list)
+    # Staging / notification.
+    staging: str = ""           # "cmux" or "" (off)
+    pretyped_cmd: str = ""
+    osascript_notify: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DispatchConfig:
+        """Build from a parsed ``[dispatch]`` table (same key set as the
+        prototype's config.json).
+
+        Keys the prototype carried but the in-tree port derives from
+        undrudge's own config — ``undrudge_db``, ``undrudge_bin``,
+        ``events_file``, ``gather_log`` — are intentionally ignored here;
+        the caller passes the undrudge ``Config`` for those.
+        """
+        cfg = cls(
+            routes=[Route.from_dict(r) for r in data.get("routes", [])],
+            clones_dir=data.get("clones_dir", ""),
+            gate_confidence=tuple(data.get("gate_confidence", ("high", "medium"))),
+            gate_forms=tuple(
+                data.get("gate_forms", ("extend_existing", "script", "slash_command"))
+            ),
+            deny_patterns=list(data.get("deny_patterns", [])),
+            apply_denylist=bool(data.get("apply_denylist", False)),
+            similarity_threshold=float(
+                data.get("similarity_threshold", recommend.SIGNATURE_SIMILARITY_THRESHOLD)
+            ),
+            similarity_min_sig_len=int(data.get("similarity_min_sig_len", 12)),
+            max_dispatch_per_run=int(data.get("max_dispatch_per_run", 6)),
+            vault_dir=data.get("vault_dir", ""),
+            state_dir=data.get("state_dir", ""),
+            git_bin=data.get("git_bin", "git"),
+            gh_bin=data.get("gh_bin", "gh"),
+            cmux_bin=data.get("cmux_bin", "cmux"),
+            a2a_pidfile=data.get("a2a_pidfile", ""),
+            mirror_cmd=list(data.get("mirror_cmd", [])),
+            staging=data.get("staging", ""),
+            pretyped_cmd=data.get("pretyped_cmd", ""),
+            osascript_notify=bool(data.get("osascript_notify", False)),
+        )
+        cfg.resolve_managed_clones()
+        return cfg
 
     def resolve_managed_clones(self) -> None:
         """Give every dir-less git route a managed clone dir + default sync.
