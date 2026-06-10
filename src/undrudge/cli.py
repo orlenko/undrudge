@@ -144,7 +144,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
-def _check_gather_health(cfg: "config.Config", check) -> None:
+def _check_gather_health(cfg: config.Config, check) -> None:
     """Surface recent gather failures from events.jsonl.
 
     Silent hourly failure is how the atuin WAL race went unnoticed for
