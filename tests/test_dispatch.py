@@ -184,3 +184,205 @@ def test_resolve_approvals_ambiguous_is_a_failure():
     resolved, failures = dispatch.resolve_approvals(raw, rec_ids)
     assert resolved == {}
     assert any("ambiguous" in f for f in failures)
+
+
+# --------------------------------------------------------------------------
+# Ledger
+# --------------------------------------------------------------------------
+
+
+def test_ledger_append_load_roundtrip(tmp_path):
+    p = tmp_path / "ledger.jsonl"
+    led = dispatch.Ledger.load(p)
+    led.append("abc123", "dispatched", route="ops")
+    led.append("abc123", "verdict", disposition="ship", artifact="http://pr/1")
+    reloaded = dispatch.Ledger.load(p)
+    assert reloaded.has_action("abc123", "dispatched")
+    assert reloaded.has_action("abc123", "verdict")
+    assert reloaded.last_verdict("abc123")["disposition"] == "ship"
+
+
+def test_ledger_in_memory_when_path_none():
+    led = dispatch.Ledger()
+    led.append("x", "dispatched")
+    assert led.has_action("x", "dispatched")  # no file, still tracked
+
+
+def test_ledger_last_verdict_is_the_latest():
+    led = dispatch.Ledger()
+    led.append("x", "verdict", disposition="needs-human")
+    led.append("x", "verdict", disposition="ship")
+    assert led.last_verdict("x")["disposition"] == "ship"
+
+
+# --------------------------------------------------------------------------
+# resolve_rid
+# --------------------------------------------------------------------------
+
+
+def test_resolve_rid_unique_prefix():
+    assert dispatch.resolve_rid("abc", ["abcdef0000001111"]) == "abcdef000000"
+
+
+def test_resolve_rid_ambiguous_falls_back_to_prefix():
+    assert dispatch.resolve_rid("ab", ["abcd1111", "abef2222"]) == "ab"
+
+
+# --------------------------------------------------------------------------
+# reconcile (invariant #1 flip-first; addendum 2)
+# --------------------------------------------------------------------------
+
+
+def _flip_recorder(fail: set[str] | None = None):
+    """A fake status-flip that records calls and can be told to fail."""
+    fail = fail or set()
+    calls = []
+
+    def flip(verb, rid, why):
+        calls.append((verb, rid))
+        return rid not in fail
+
+    return flip, calls
+
+
+def _vf(id12, disposition, route="ops", artifact=None, reason=None):
+    return dispatch.VerdictFile(
+        data={"id": id12, "disposition": disposition,
+              "artifact": artifact, "reason": reason},
+        fallback_id=id12, route_name=route,
+    )
+
+
+def test_reconcile_dismiss_verdict_flips_then_ledgers():
+    led = dispatch.Ledger()
+    flip, calls = _flip_recorder()
+    rep = dispatch.reconcile(
+        ledger=led, logged_ids={"aaaa11112222"}, all_ids=["aaaa11112222ffff"],
+        verdicts=[_vf("aaaa11112222", "dismiss-stale")],
+        flip=flip, gh_state=lambda a, r: None,
+    )
+    assert ("dismiss", "aaaa11112222") in calls
+    assert led.has_action("aaaa11112222", "verdict")
+    assert rep.flips == 1
+
+
+def test_reconcile_flip_failure_does_not_ledger_so_it_retries():
+    led = dispatch.Ledger()
+    flip, _ = _flip_recorder(fail={"aaaa11112222"})
+    rep = dispatch.reconcile(
+        ledger=led, logged_ids={"aaaa11112222"}, all_ids=["aaaa11112222"],
+        verdicts=[_vf("aaaa11112222", "reject-as-framed")],
+        flip=flip, gh_state=lambda a, r: None,
+    )
+    # Flip failed -> no verdict ledgered -> next run retries.
+    assert not led.has_action("aaaa11112222", "verdict")
+    assert any("failed" in f for f in rep.failures)
+
+
+def test_reconcile_already_processed_verdict_skipped():
+    led = dispatch.Ledger()
+    led.append("aaaa11112222", "verdict", disposition="ship")
+    flip, calls = _flip_recorder()
+    dispatch.reconcile(
+        ledger=led, logged_ids={"aaaa11112222"}, all_ids=["aaaa11112222"],
+        verdicts=[_vf("aaaa11112222", "dismiss-stale")],
+        flip=flip, gh_state=lambda a, r: None,
+    )
+    assert calls == []  # no re-flip
+
+
+def test_reconcile_needs_human_becomes_a_hold():
+    led = dispatch.Ledger()
+    led.append("aaaa11112222", "verdict", disposition="needs-human", reason="need creds")
+    rep = dispatch.reconcile(
+        ledger=led, logged_ids={"aaaa11112222"}, all_ids=["aaaa11112222"],
+        verdicts=[], flip=lambda *a: True, gh_state=lambda a, r: None,
+    )
+    assert rep.holds.get("aaaa11112222") == ("needs-human", "need creds")
+
+
+def test_reconcile_ship_pr_merged_implements():
+    led = dispatch.Ledger()
+    led.append("aaaa11112222", "verdict", disposition="ship",
+               artifact="https://github.com/o/r/pull/1", route="ops")
+    flip, calls = _flip_recorder()
+    rep = dispatch.reconcile(
+        ledger=led, logged_ids=set(), all_ids=["aaaa11112222"], verdicts=[],
+        flip=flip, gh_state=lambda a, r: "MERGED",
+    )
+    assert ("implement", "aaaa11112222") in calls
+    assert led.has_action("aaaa11112222", "pr-merged")
+    assert any("implemented" in c for c in rep.completed)
+
+
+def test_reconcile_ship_pr_closed_dismisses():
+    led = dispatch.Ledger()
+    led.append("aaaa11112222", "verdict", disposition="ship",
+               artifact="https://github.com/o/r/pull/1", route="ops")
+    flip, calls = _flip_recorder()
+    dispatch.reconcile(
+        ledger=led, logged_ids=set(), all_ids=["aaaa11112222"], verdicts=[],
+        flip=flip, gh_state=lambda a, r: "CLOSED",
+    )
+    assert ("dismiss", "aaaa11112222") in calls
+    assert led.has_action("aaaa11112222", "pr-closed")
+
+
+def test_reconcile_ship_pr_open_is_pending():
+    led = dispatch.Ledger()
+    led.append("aaaa11112222", "verdict", disposition="ship",
+               artifact="https://github.com/o/r/pull/1", route="ops")
+    rep = dispatch.reconcile(
+        ledger=led, logged_ids=set(), all_ids=["aaaa11112222"], verdicts=[],
+        flip=lambda *a: True, gh_state=lambda a, r: "OPEN",
+    )
+    assert any("aaaa11112222" in p for p in rep.pending_prs)
+
+
+def test_reconcile_non_url_artifact_flagged_only_while_logged():
+    # Still logged -> needs manual close-out (failure).
+    led = dispatch.Ledger()
+    led.append("aaaa11112222", "verdict", disposition="ship", artifact="/some/file.py")
+    rep = dispatch.reconcile(
+        ledger=led, logged_ids={"aaaa11112222"}, all_ids=["aaaa11112222"],
+        verdicts=[], flip=lambda *a: True, gh_state=lambda a, r: None,
+    )
+    assert any("needs manual close-out" in f for f in rep.failures)
+    assert led.has_action("aaaa11112222", "artifact-unusable")
+
+
+def test_reconcile_non_url_artifact_clean_terminal_when_not_logged():
+    # addendum 2: a non-git route implemented directly and left logged set.
+    led = dispatch.Ledger()
+    led.append("aaaa11112222", "verdict", disposition="ship", artifact="/some/file.py")
+    rep = dispatch.reconcile(
+        ledger=led, logged_ids=set(), all_ids=["aaaa11112222"],
+        verdicts=[], flip=lambda *a: True, gh_state=lambda a, r: None,
+    )
+    assert rep.failures == []  # not an error
+    assert not led.has_action("aaaa11112222", "artifact-unusable")
+
+
+# --------------------------------------------------------------------------
+# collect_verdict_files
+# --------------------------------------------------------------------------
+
+
+def test_collect_verdict_files_from_done_and_spool():
+    routes = [Route(name="ops", dir="/clones/ops")]
+    tree = {
+        "/clones/ops/.undrudge-inbox/done": ["a1b2.verdict.json", "notes.txt"],
+        "/spool": ["c3d4.verdict.json"],
+    }
+    files = {
+        "/clones/ops/.undrudge-inbox/done/a1b2.verdict.json": {"id": "a1b2", "disposition": "ship"},
+        "/spool/c3d4.verdict.json": {"id": "c3d4", "disposition": "dismiss-stale"},
+    }
+    out = dispatch.collect_verdict_files(
+        routes, "/spool",
+        isdir=lambda d: d in tree,
+        listdir=lambda d: tree.get(d, []),
+        load_json=lambda p: files[p],
+    )
+    got = {(v.route_name, v.data["disposition"]) for v in out}
+    assert got == {("ops", "ship"), ("spool", "dismiss-stale")}

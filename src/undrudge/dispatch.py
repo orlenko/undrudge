@@ -20,6 +20,7 @@ testable, independent of any filesystem or git I/O.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -320,3 +321,224 @@ def resolve_approvals(
                 f"approval `{key}` matches no logged rec (already closed?)"
             )
     return resolved, failures
+
+
+# --------------------------------------------------------------------------
+# Ledger — dispatch-specific append-only history
+# --------------------------------------------------------------------------
+
+
+class Ledger:
+    """Per-rec courier history: dispatched / verdict / pr-merged / ...
+
+    Distinct from undrudge's events.jsonl and the recommendations table.
+    The rec STATUS (dispatched/rejected/...) lives in undrudge now, so the
+    ledger is "demoted to a plain log" (devlog's words) — but the rich
+    courier history (which route, which PR artifact, whether a ship PR has
+    been polled to merge) still has no home in undrudge's schema, so the
+    dispatcher keeps it here. Keyed by id12.
+    """
+
+    def __init__(self, entries: dict[str, list[dict]] | None = None,
+                 path: Any = None) -> None:
+        self.entries: dict[str, list[dict]] = entries or {}
+        self.path = path  # pathlib.Path or None (None = in-memory / dry-run)
+
+    @classmethod
+    def load(cls, path: Any) -> Ledger:
+        entries: dict[str, list[dict]] = {}
+        if path is not None and path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                entries.setdefault(e.get("rec_id", "?"), []).append(e)
+        return cls(entries=entries, path=path)
+
+    def append(self, rec_id: str, action: str, *, ts: str = "", **kw: Any) -> None:
+        e = {"ts": ts, "rec_id": rec_id, "action": action, **kw}
+        self.entries.setdefault(rec_id, []).append(e)
+        if self.path is not None:
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(e) + "\n")
+
+    def has_action(self, rec_id: str, *actions: str) -> bool:
+        return any(
+            e.get("action") in actions for e in self.entries.get(rec_id, [])
+        )
+
+    def last_verdict(self, rec_id: str) -> dict | None:
+        for e in reversed(self.entries.get(rec_id, [])):
+            if e.get("action") == "verdict":
+                return e
+        return None
+
+
+# --------------------------------------------------------------------------
+# Verdict collection + reconcile (invariants #1, #2; addendum 2)
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class VerdictFile:
+    data: dict
+    fallback_id: str   # from the filename, used when data has no "id"
+    route_name: str
+
+
+def collect_verdict_files(
+    routes: list[Route],
+    spool_dir: str,
+    *,
+    isdir: Callable[[str], bool],
+    listdir: Callable[[str], list[str]],
+    load_json: Callable[[str], dict],
+) -> list[VerdictFile]:
+    """Gather ``*.verdict.json`` from each route's ``.undrudge-inbox/done/``
+    and the central single-id spool. I/O is injected so it's testable.
+    """
+    found: list[VerdictFile] = []
+    for route in routes:
+        done_dir = f"{route.dir}/.undrudge-inbox/done"
+        if isdir(done_dir):
+            for fn in sorted(listdir(done_dir)):
+                if fn.endswith(".verdict.json"):
+                    found.append(VerdictFile(
+                        data=load_json(f"{done_dir}/{fn}"),
+                        fallback_id=fn.split(".")[0],
+                        route_name=route.name,
+                    ))
+    if isdir(spool_dir):
+        for fn in sorted(listdir(spool_dir)):
+            if fn.endswith(".verdict.json"):
+                found.append(VerdictFile(
+                    data=load_json(f"{spool_dir}/{fn}"),
+                    fallback_id=fn.split(".")[0],
+                    route_name="spool",
+                ))
+    return found
+
+
+def resolve_rid(prefix: str, all_ids: list[str]) -> str:
+    """Resolve a verdict's id-prefix to a unique full id's 12-char head;
+    fall back to the bare prefix when it isn't a unique match."""
+    matches = [i for i in all_ids if i.startswith(prefix)]
+    return matches[0][:12] if len(matches) == 1 else prefix[:12]
+
+
+@dataclass
+class ReconcileReport:
+    flips: int = 0
+    flipped_ids: set[str] = field(default_factory=set)
+    verdicts: list[str] = field(default_factory=list)
+    completed: list[str] = field(default_factory=list)
+    pending_prs: list[str] = field(default_factory=list)
+    failures: list[str] = field(default_factory=list)
+    # id12 -> (disposition, reason) for needs-human / convert-to-task holds.
+    holds: dict[str, tuple[str, str]] = field(default_factory=dict)
+
+
+def reconcile(
+    *,
+    ledger: Ledger,
+    logged_ids: set[str],
+    all_ids: list[str],
+    verdicts: list[VerdictFile],
+    flip: Callable[[str, str, str], bool],
+    gh_state: Callable[[str, str], str | None],
+    now: str = "",
+) -> ReconcileReport:
+    """Reconcile session verdicts + draft-PR outcomes back into statuses.
+
+    ``flip(verb, id12, why) -> bool`` performs a status change via
+    ``recommend.set_status`` (the single flip path — invariant #1) and
+    reports success. ``gh_state(artifact_url, route_name) -> state|None``
+    returns a PR state (``MERGED``/``CLOSED``/other) or ``None`` if gh is
+    unavailable. Both are injected so this is testable without a store or
+    subprocess.
+
+    Invariant #1: flip FIRST, ledger the verdict only on a successful flip,
+    so a transient failure is retried next run and never strands a rec.
+    """
+    rep = ReconcileReport()
+
+    def do_flip(verb: str, rid: str, why: str) -> bool:
+        if flip(verb, rid, why):
+            rep.flips += 1
+            rep.flipped_ids.add(rid)
+            return True
+        rep.failures.append(f"undrudge {verb} {rid} failed (will retry next run)")
+        return False
+
+    # 1. Apply session verdicts.
+    for vf in verdicts:
+        rid = resolve_rid(vf.data.get("id") or vf.fallback_id, all_ids)
+        if ledger.has_action(rid, "verdict"):
+            continue  # already reconciled on a prior run
+        disp = vf.data.get("disposition", "")
+        # Decide the flip this verdict implies, then flip FIRST; on a failed
+        # flip skip the ledger so the verdict retries next run (invariant #1).
+        flip_needed: tuple[str, str] | None = None
+        if rid in logged_ids and disp in DISMISS_CLASS:
+            flip_needed = ("dismiss", f"verdict {disp}")
+        elif rid in logged_ids and disp == "already-done":
+            flip_needed = ("implement", "verdict already-done")
+        if flip_needed and not do_flip(flip_needed[0], rid, flip_needed[1]):
+            continue
+        ledger.append(rid, "verdict", ts=now, disposition=disp,
+                      reason=vf.data.get("reason"), artifact=vf.data.get("artifact"),
+                      route=vf.route_name)
+        rep.verdicts.append(
+            f"{rid} [{vf.route_name}] {disp} — {(vf.data.get('reason') or '')[:140]}"
+        )
+
+    # 2. Standing holds: needs-human / convert-to-task re-surface every run
+    #    until a human moves the rec out of 'logged'.
+    for rid in list(ledger.entries):
+        v = ledger.last_verdict(rid)
+        if v and v.get("disposition") in NEEDS_HUMAN and rid in logged_ids:
+            rep.holds[rid] = (v["disposition"], v.get("reason") or "")
+
+    # 3. Poll open ship PRs.
+    for rid in list(ledger.entries):
+        ship = next(
+            (e for e in ledger.entries[rid]
+             if e.get("action") == "verdict" and e.get("disposition") == "ship"),
+            None,
+        )
+        if not ship or ledger.has_action(rid, "pr-merged", "pr-closed"):
+            continue
+        artifact = str(ship.get("artifact") or "")
+        if not artifact.startswith("http"):
+            # addendum 2: a non-URL artifact is only "needs manual close-out"
+            # while the rec is STILL logged. A non-git route that implemented
+            # directly (flipping its own status, recording a file path) is a
+            # clean terminal state, not an error.
+            if rid not in logged_ids:
+                continue
+            if not ledger.has_action(rid, "artifact-unusable"):
+                ledger.append(rid, "artifact-unusable", ts=now, artifact=artifact)
+                rep.failures.append(
+                    f"{rid} ship verdict has no usable PR URL "
+                    f"(artifact={artifact!r}) — needs manual close-out"
+                )
+            continue
+        state = gh_state(artifact, str(ship.get("route", "")))
+        if state is None:
+            rep.pending_prs.append(f"{rid} {artifact} (gh unavailable)")
+        elif state == "MERGED":
+            if do_flip("implement", rid, "PR merged"):
+                ledger.append(rid, "pr-merged", ts=now, artifact=artifact)
+                rep.completed.append(f"{rid} implemented (PR merged {artifact})")
+        elif state == "CLOSED":
+            if do_flip("dismiss", rid, "PR closed unmerged"):
+                ledger.append(rid, "pr-closed", ts=now, artifact=artifact)
+                rep.completed.append(f"{rid} dismissed (PR closed {artifact})")
+        else:
+            rep.pending_prs.append(f"{rid} {artifact} (open)")
+
+    return rep
