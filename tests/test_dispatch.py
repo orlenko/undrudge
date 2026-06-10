@@ -1,0 +1,186 @@
+"""Dispatch decision logic — pure, I/O-free unit tests.
+
+Covers the deterministic core ported from the undrudge-dispatch
+prototype: managed-clone resolution, routing precedence (invariant #4),
+gating, dismissal similarity, and the approval-queue grammar (#3).
+"""
+
+from __future__ import annotations
+
+from undrudge import dispatch
+from undrudge.dispatch import DispatchConfig, Route
+
+
+def _cfg(**kw) -> DispatchConfig:
+    routes = kw.pop("routes", [])
+    return DispatchConfig(routes=routes, **kw)
+
+
+# --------------------------------------------------------------------------
+# Managed clones (addendum 1)
+# --------------------------------------------------------------------------
+
+
+def test_resolve_managed_clones_materializes_dirless_route():
+    cfg = _cfg(
+        clones_dir="/Users/x/code/undrudge-checks",
+        routes=[Route(name="volpe-lite", clone_url="git@h:o/v.git", branch="develop")],
+    )
+    cfg.resolve_managed_clones()
+    r = cfg.routes[0]
+    assert r.dir == "/Users/x/code/undrudge-checks/volpe-lite"
+    assert r.managed_clone is True
+    assert r.sync == ["fetch", "switch:develop", "pull"]
+
+
+def test_resolve_managed_clones_leaves_explicit_dir_untouched():
+    cfg = _cfg(
+        clones_dir="/Users/x/code/undrudge-checks",
+        routes=[Route(name="ops", dir="/Users/x/code2/ops")],
+    )
+    cfg.resolve_managed_clones()
+    r = cfg.routes[0]
+    assert r.dir == "/Users/x/code2/ops"
+    assert r.managed_clone is False
+    assert r.sync is None  # explicit/pinned route keeps its own (or no) sync
+
+
+# --------------------------------------------------------------------------
+# normalize_origin / path_under
+# --------------------------------------------------------------------------
+
+
+def test_normalize_origin_forms_match():
+    a = dispatch.normalize_origin("git@github.com:orlenko/undrudge.git")
+    b = dispatch.normalize_origin("https://github.com/orlenko/undrudge")
+    c = dispatch.normalize_origin("ssh://git@github.com/orlenko/undrudge.git")
+    assert a == b == c == "github.com/orlenko/undrudge"
+
+
+def test_path_under():
+    assert dispatch.path_under("/a/b", "/a")
+    assert dispatch.path_under("/a", "/a")
+    assert not dispatch.path_under("/ab", "/a")
+    assert not dispatch.path_under("/c", "/a")
+
+
+# --------------------------------------------------------------------------
+# Routing precedence (invariant #4)
+# --------------------------------------------------------------------------
+
+
+def test_route_agent_global_goes_to_vault():
+    cfg = _cfg(routes=[Route(name="vault"), Route(name="ops")])
+    d = dispatch.route_for({"target_scope": "agent_global"}, "anything", [], cfg)
+    assert d.route is not None and d.route.name == "vault"
+
+
+def test_route_title_hint_overrides_cwd():
+    cfg = _cfg(routes=[
+        Route(name="ops", cwd_prefixes=["/Users/x/code/ops"]),
+        Route(name="volpe-lite"),
+    ])
+    # Evidence cwd is under ops, but the title names volpe-lite → title wins.
+    d = dispatch.route_for(
+        {}, "Speed up volpe-lite deploy", ["/Users/x/code/ops/sub"], cfg
+    )
+    assert d.route is not None and d.route.name == "volpe-lite"
+    assert d.note and "routed by title" in d.note
+
+
+def test_route_cwd_prefix_match():
+    cfg = _cfg(routes=[Route(name="ops", cwd_prefixes=["/Users/x/code/ops"])])
+    d = dispatch.route_for({}, "no route name here", ["/Users/x/code/ops/a"], cfg)
+    assert d.route is not None and d.route.name == "ops"
+    assert d.note is None
+
+
+def test_route_origin_fallback():
+    cfg = _cfg(routes=[Route(name="fab", origins=["github.com/orlenko/fab"])])
+    origins = {"/Users/x/somewhere": "git@github.com:orlenko/fab.git"}
+    d = dispatch.route_for(
+        {}, "title", ["/Users/x/somewhere"], cfg,
+        origin_of=lambda c: origins.get(c), isdir=lambda c: True,
+    )
+    assert d.route is not None and d.route.name == "fab"
+
+
+def test_route_unresolved_returns_none():
+    cfg = _cfg(routes=[Route(name="ops", cwd_prefixes=["/Users/x/code/ops"])])
+    d = dispatch.route_for({}, "title", ["/elsewhere"], cfg,
+                           origin_of=lambda c: None, isdir=lambda c: True)
+    assert d.route is None
+
+
+# --------------------------------------------------------------------------
+# Gating
+# --------------------------------------------------------------------------
+
+
+def test_deny_hit():
+    pats = [r"\brm -rf\b", r"force.?push"]
+    assert dispatch.deny_hit("clean up", "rm -rf <path>", "", pats) == r"\brm -rf\b"
+    assert dispatch.deny_hit("safe", "ls -la", "body", pats) is None
+
+
+def test_similar_dismissed_reuses_undrudge_similarity():
+    cfg = _cfg(similarity_threshold=0.85, similarity_min_sig_len=8)
+    dismissed = [("aaaa11112222", "Wrap find/grep", "find . -name <str> | xargs grep <str>")]
+    hit = dispatch.similar_dismissed(
+        "find . -name <str> -type f | xargs grep <str>", dismissed, cfg
+    )
+    assert hit is not None and hit[0] == "aaaa11112222"
+
+
+def test_similar_dismissed_ignores_unrelated():
+    cfg = _cfg(similarity_threshold=0.85, similarity_min_sig_len=8)
+    dismissed = [("aaaa11112222", "x", "find . -name <str> | xargs grep <str>")]
+    assert dispatch.similar_dismissed("git rebase -i HEAD~<n>", dismissed, cfg) is None
+
+
+def test_similar_dismissed_skips_short_signatures():
+    cfg = _cfg(similarity_threshold=0.85, similarity_min_sig_len=20)
+    dismissed = [("a", "x", "ls")]
+    assert dispatch.similar_dismissed("ls", dismissed, cfg) is None
+
+
+# --------------------------------------------------------------------------
+# Approval grammar (invariant #3)
+# --------------------------------------------------------------------------
+
+
+def test_parse_approvals_grammar():
+    text = "\n".join([
+        "# queue",
+        "- [x] approve a1b2c3d4e5f6",
+        "- [x] approve 99887766 -> volpe-lite",
+        "- [x] dismiss deadbeef00 — reason: too niche",
+        "- [ ] approve unchecked0000",      # unchecked → ignored
+        "- [x] frobnicate abc123",          # checked but malformed
+    ])
+    actions, malformed = dispatch.parse_approvals(text)
+    assert set(actions) == {"a1b2c3d4e5f6", "99887766", "deadbeef00"}
+    assert actions["99887766"].action == "approve"
+    assert actions["99887766"].route == "volpe-lite"
+    assert actions["deadbeef00"].action == "dismiss"
+    assert actions["deadbeef00"].reason == "too niche"
+    assert any("frobnicate" in m for m in malformed)
+
+
+def test_resolve_approvals_prefix_match():
+    raw = {
+        "a1b2": dispatch.Approval("approve", None, ""),
+        "ffff": dispatch.Approval("dismiss", None, "no"),
+    }
+    rec_ids = ["a1b2c3d4e5f6aaaa", "0000111122223333"]
+    resolved, failures = dispatch.resolve_approvals(raw, rec_ids)
+    assert "a1b2c3d4e5f6" in resolved
+    assert any("ffff" in f and "no logged rec" in f for f in failures)
+
+
+def test_resolve_approvals_ambiguous_is_a_failure():
+    raw = {"ab": dispatch.Approval("approve", None, "")}
+    rec_ids = ["abcd00001111", "abef00002222"]
+    resolved, failures = dispatch.resolve_approvals(raw, rec_ids)
+    assert resolved == {}
+    assert any("ambiguous" in f for f in failures)
