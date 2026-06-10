@@ -37,10 +37,19 @@ logger = logging.getLogger(__name__)
 ATUIN_SOURCE = "atuin"
 
 # Backup-API snapshots cooperate with the WAL writer at the page level,
-# but very heavy load can still surface SQLITE_BUSY or transient errors.
-# Three attempts with a small backoff is plenty for an hourly job.
-_SNAPSHOT_ATTEMPTS = 3
+# but opening the *source* still does the WAL/-shm handshake, which under
+# a heavy write burst (or a checkpoint mid-flight) can transiently fail
+# with SQLITE_CANTOPEN ("unable to open database file") or SQLITE_BUSY.
+# These windows are short — usually sub-second — so we ride them out with
+# exponential backoff over a ~15s budget. The gather job runs hourly, so
+# spending a few seconds retrying is free; the alternative (failing the
+# run) self-heals next hour but flags a noisy warning in the morning
+# report. ``busy_timeout`` on the source handle covers the BUSY case
+# directly; backoff covers CANTOPEN, which busy_timeout does not.
+_SNAPSHOT_ATTEMPTS = 6
 _SNAPSHOT_BACKOFF_SECONDS = 0.5
+_SNAPSHOT_BACKOFF_CAP_SECONDS = 8.0
+_SOURCE_BUSY_TIMEOUT_MS = 5000
 
 
 @dataclass
@@ -211,13 +220,25 @@ def _read_atuin_rows_via_snapshot(
             return _snapshot_and_read_once(atuin_db_path, cursor_ns)
         except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
             last_exc = e
+            # Log the concrete SQLite error name (CANTOPEN vs BUSY vs …)
+            # so production failures are diagnosable from gather.log
+            # instead of just "unable to open database file".
+            errname = getattr(e, "sqlite_errorname", None) or "?"
             if attempt < _SNAPSHOT_ATTEMPTS - 1:
-                delay = _SNAPSHOT_BACKOFF_SECONDS * (2 ** attempt)
+                delay = min(
+                    _SNAPSHOT_BACKOFF_SECONDS * (2 ** attempt),
+                    _SNAPSHOT_BACKOFF_CAP_SECONDS,
+                )
                 logger.warning(
-                    "atuin snapshot attempt %d/%d failed (%s); retry in %.1fs",
-                    attempt + 1, _SNAPSHOT_ATTEMPTS, e, delay,
+                    "atuin snapshot attempt %d/%d failed (%s: %s); retry in %.1fs",
+                    attempt + 1, _SNAPSHOT_ATTEMPTS, errname, e, delay,
                 )
                 time.sleep(delay)
+            else:
+                logger.warning(
+                    "atuin snapshot exhausted %d attempts (%s: %s)",
+                    _SNAPSHOT_ATTEMPTS, errname, e,
+                )
     assert last_exc is not None
     raise last_exc
 
@@ -230,6 +251,12 @@ def _snapshot_and_read_once(
 
         src = sqlite3.connect(f"file:{atuin_db_path}?mode=ro", uri=True)
         try:
+            # Wait, rather than instantly fail, if a page read hits a held
+            # lock mid-backup. Covers the SQLITE_BUSY component of the WAL
+            # contention; does nothing for CANTOPEN (the backoff loop owns
+            # that), but it's cheap insurance and never blocks longer than
+            # the timeout.
+            src.execute(f"PRAGMA busy_timeout = {_SOURCE_BUSY_TIMEOUT_MS}")
             dst = sqlite3.connect(snapshot_path)
             try:
                 src.backup(dst)
