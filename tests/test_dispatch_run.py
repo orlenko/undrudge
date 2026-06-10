@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from undrudge import config as cfg_mod
-from undrudge import dispatch, store
+from undrudge import dispatch, dispatch_run, store
 from undrudge.dispatch import DispatchConfig, Route
 from undrudge.dispatch_run import Dispatcher
 
@@ -136,3 +136,48 @@ def test_status_lists_logged_recs(tmp_path: Path):
     lines = d.status()
     assert any("logged recs: 1" in line for line in lines)
     assert any("a1b2c3d4e5f6" in line and "pending" in line for line in lines)
+
+
+# --------------------------------------------------------------------------
+# Config resolution: [dispatch] TOML preferred, prototype config.json fallback
+# --------------------------------------------------------------------------
+
+
+def _ucfg_min(tmp_path: Path) -> cfg_mod.Config:
+    return _ucfg(tmp_path, tmp_path / "db.sqlite")
+
+
+def test_load_config_prefers_dispatch_toml(tmp_path: Path):
+    toml = tmp_path / "config.toml"
+    toml.write_text(
+        '[dispatch]\nclones_dir = "/c"\n'
+        '[[dispatch.routes]]\nname = "r-toml"\ndir = "/d"\n'
+    )
+    proto = tmp_path / "config.json"
+    proto.write_text(json.dumps({"clones_dir": "/x", "routes": [{"name": "r-json"}]}))
+    cfg = dispatch_run.load_dispatch_config(
+        _ucfg_min(tmp_path), config_toml_path=toml, prototype_json_path=str(proto))
+    assert cfg is not None
+    assert cfg.clones_dir == "/c"
+    assert cfg.routes[0].name == "r-toml"  # TOML wins over the JSON fallback
+
+
+def test_load_config_falls_back_to_prototype_json(tmp_path: Path):
+    toml = tmp_path / "config.toml"
+    toml.write_text('[paths]\ndb = "x"\n')  # no [dispatch] table
+    proto = tmp_path / "config.json"
+    proto.write_text(json.dumps(
+        {"clones_dir": "/c2", "routes": [{"name": "r2", "dir": "/d2"}]}))
+    cfg = dispatch_run.load_dispatch_config(
+        _ucfg_min(tmp_path), config_toml_path=toml, prototype_json_path=str(proto))
+    assert cfg is not None
+    assert cfg.clones_dir == "/c2"
+    assert cfg.routes[0].name == "r2"
+
+
+def test_load_config_none_when_unconfigured(tmp_path: Path):
+    cfg = dispatch_run.load_dispatch_config(
+        _ucfg_min(tmp_path),
+        config_toml_path=tmp_path / "missing.toml",
+        prototype_json_path=str(tmp_path / "missing.json"))
+    assert cfg is None

@@ -538,17 +538,45 @@ def _load_json(path: str) -> dict:
         return {}
 
 
-def load_dispatch_config(ucfg: cfg_mod.Config) -> dispatch.DispatchConfig | None:
-    """Read the ``[dispatch]`` table from undrudge's config.toml, if present."""
+# The standalone prototype's config lives here. During the coexistence
+# period (prototype still on launchd, port available as `undrudge
+# dispatch`), the port falls back to reading it so both run off ONE
+# source of truth — no hand-migration into a [dispatch] TOML block.
+PROTOTYPE_CONFIG_PATH = os.path.expanduser("~/.config/undrudge-dispatch/config.json")
+
+
+def load_dispatch_config(
+    ucfg: cfg_mod.Config,
+    *,
+    config_toml_path: Path | None = None,
+    prototype_json_path: str | None = None,
+) -> dispatch.DispatchConfig | None:
+    """Resolve the dispatch config.
+
+    Prefers a ``[dispatch]`` table in undrudge's own config.toml. Failing
+    that, falls back to the standalone prototype's ``config.json`` so the
+    two tools share config while they coexist. Returns ``None`` if neither
+    is configured.
+    """
     import tomllib
-    path = cfg_mod.default_config_path()
-    if not path.exists():
-        return None
-    raw = tomllib.loads(path.read_text())
-    table = raw.get("dispatch")
-    if not table:
-        return None
-    return dispatch.DispatchConfig.from_dict(table)
+
+    toml_path = config_toml_path or cfg_mod.default_config_path()
+    if toml_path.exists():
+        try:
+            table = tomllib.loads(toml_path.read_text()).get("dispatch")
+        except (OSError, tomllib.TOMLDecodeError):
+            table = None
+        if table:
+            return dispatch.DispatchConfig.from_dict(table)
+
+    proto = Path(prototype_json_path or PROTOTYPE_CONFIG_PATH)
+    if proto.exists():
+        try:
+            data = json.loads(proto.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return dispatch.DispatchConfig.from_dict(data)
+    return None
 
 
 def cmd_dispatch(ucfg: cfg_mod.Config, *, subcmd: str, dry: bool) -> int:
