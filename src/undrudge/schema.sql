@@ -3,6 +3,7 @@ PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS sessions (
   id          TEXT PRIMARY KEY,
+  source      TEXT NOT NULL DEFAULT 'claude',
   project     TEXT,
   started_at  INTEGER,
   last_seen   INTEGER
@@ -18,7 +19,12 @@ CREATE TABLE IF NOT EXISTS messages (
   tool_name   TEXT,
   tool_input  TEXT,
   tool_result TEXT,
-  is_error    INTEGER DEFAULT 0
+  is_error    INTEGER DEFAULT 0,
+  -- Transcript provenance: 'main' for the session's own conversation,
+  -- 'subagent' for sidechain/teammate/workflow agent transcripts (which
+  -- share the parent sessionId). NULL on rows ingested before the column
+  -- existed — treat as 'main'.
+  origin      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);

@@ -213,6 +213,14 @@ def _ingest_line(
     # Ensure the session row exists before we insert any FK-bound messages.
     _upsert_session(conn, session_id, state)
 
+    # Provenance: subagent/teammate/workflow transcripts live in separate
+    # agent-*.jsonl files but share the parent sessionId, so without this
+    # tag their rows are indistinguishable from the main conversation.
+    # Their 'user' messages are authored by the orchestrating model, not
+    # the human — the digest needs to know the difference. isSidechain
+    # also catches older transcripts that embedded sidechains inline.
+    origin = "subagent" if (d.get("isSidechain") or d.get("agentId")) else "main"
+
     msg = d.get("message") or {}
     role = msg.get("role") or t
 
@@ -262,8 +270,8 @@ def _ingest_line(
         try:
             cur = conn.execute(
                 """INSERT OR IGNORE INTO messages
-                       (id, session_id, seq, ts, role, text, tool_name, tool_input, tool_result, is_error)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (id, session_id, seq, ts, role, text, tool_name, tool_input, tool_result, is_error, origin)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     message_id,
                     session_id,
@@ -275,6 +283,7 @@ def _ingest_line(
                     tool_input,
                     tool_result,
                     is_error,
+                    origin,
                 ),
             )
             if cur.rowcount > 0:
@@ -364,7 +373,7 @@ def ingest(
         )
 
     stats.sessions_touched = conn.execute(
-        "SELECT COUNT(*) FROM sessions"
+        "SELECT COUNT(*) FROM sessions WHERE source = 'claude'"
     ).fetchone()[0]
     logger.info(
         "claude ingest done: files=%d (skipped=%d) lines=%d rows=%d sessions=%d redaction_drops=%d",

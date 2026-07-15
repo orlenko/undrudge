@@ -1,7 +1,7 @@
 """SQLite store. Thin wrapper around stdlib ``sqlite3``.
 
 The DB is a query cache, not a system of record — the source of truth lives
-in the Claude JSONL files and atuin's history.db. If anything ever corrupts
+in Claude/Codex JSONL files and atuin's history.db. If anything ever corrupts
 here, delete and re-ingest.
 """
 
@@ -41,9 +41,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
     already there, which means new columns we add to the schema never
     land on existing files. Tiny ALTER TABLE bridge per added column.
     """
+    _ensure_columns(conn, "sessions", {
+        "source": "ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'claude'",
+    })
     _ensure_columns(conn, "commands", {
         "author": "ALTER TABLE commands ADD COLUMN author TEXT",
         "intent": "ALTER TABLE commands ADD COLUMN intent TEXT",
+    })
+    _ensure_columns(conn, "messages", {
+        "origin": "ALTER TABLE messages ADD COLUMN origin TEXT",
     })
     _ensure_columns(conn, "recommendations", {
         "reason": "ALTER TABLE recommendations ADD COLUMN reason TEXT",

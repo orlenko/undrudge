@@ -1,6 +1,11 @@
-# undrudge — plan
+# undrudge — original v1 plan
 
-A retrospective tool that watches my Claude Code activity and shell history,
+> Historical rationale, not a complete description of current behavior. Use
+> `README.md`, current source, and tests for the operator contract. Later work
+> added Codex ingestion, dispatch/status flows, and other commands without
+> rewriting this plan wholesale.
+
+A retrospective tool that watches my Claude Code, Codex, and shell history,
 finds patterns worth automating, and writes recommendations as markdown files.
 Daily detection, weekly meta-analysis, no daemon, no UI, no real-time, no
 external services.
@@ -59,7 +64,7 @@ One binary, six subcommands:
 | Subcommand            | What it does                                                              |
 |-----------------------|---------------------------------------------------------------------------|
 | `undrudge init`       | Create XDG dirs, write default config, apply schema.                      |
-| `undrudge gather`     | Ingest new Claude messages and shell commands. Idempotent. **Hourly.**    |
+| `undrudge gather`     | Ingest new Claude/Codex messages and shell commands. Idempotent. **Hourly.** |
 | `undrudge analyze`    | Render digest, call `claude -p`, write recommendations. **Daily.**         |
 | `undrudge analyze --meta --window 7d` | Same code path; reads daily digests instead of raw activity. **Weekly.** |
 | `undrudge list`       | Print recommendations index (filter by `--since`, `--status`).             |
@@ -102,6 +107,7 @@ misc/undrudge/
     schema.sql
     sanitize.py
     ingest_claude.py
+    ingest_codex.py
     ingest_shell.py
     digest.py
     analyze.py
@@ -301,6 +307,9 @@ digests_dir = "~/.local/share/undrudge/digests"
 [claude]
 projects_root = "~/.claude/projects"
 
+[codex]
+home = "~/.codex"  # scans sessions/ and archived_sessions/
+
 [atuin]
 db = "~/.local/share/atuin/history.db"
 
@@ -354,7 +363,8 @@ laptop-friendly catch-up scheduling.
 - Real-time intervention.
 - Web UI / browser.
 - MCP server exposing search.
-- Multi-tool ingest (Codex, Cursor, Gemini) — defer until their share rises.
+- Additional agent-history providers (Cursor, Gemini) — defer until their
+  share rises.
 - Active tool registry / capability tagging.
 - Automatic implementation of recommendations — human in the loop indefinitely.
 - Cross-machine sync — recommendations and DB are per-machine. Sync, if ever

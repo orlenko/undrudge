@@ -3,7 +3,7 @@
 <img width="1448" height="1086" alt="rozmarujennya" src="https://github.com/user-attachments/assets/57259488-e837-4ae9-96f9-fe5aff6fb96f" />
 
 
-A background watchman that watches what you do in Claude Code and your
+A background watchman that watches what you do in Claude Code, Codex, and your
 shell, spots the chores you keep redoing by hand instead of factoring
 out, and writes recommendations to disk for you to read at your leisure.
 
@@ -16,7 +16,7 @@ when you could just rearrange the room.
 
 I built undrudge for myself, after noticing that I kept retyping the
 same shell compounds and pasting the same prompts across sessions. It
-runs on cron, reads my Claude session JSONL and atuin shell history,
+runs on cron, reads my Claude and Codex session JSONL plus atuin shell history,
 sanitizes everything before storage, and once a day asks `claude -p`
 "what did I do repeatedly that a script could have done?" The answers
 land as markdown files I read during my normal review.
@@ -46,16 +46,17 @@ Rust binary).
 ```bash
 undrudge init                # create ~/.config/undrudge/config.toml,
                              # ~/.local/share/undrudge/, and the SQLite db
-undrudge doctor              # sanity-check paths, atuin, claude CLI
+undrudge doctor              # sanity-check histories, atuin, and the LLM CLI
 ```
 
-Edit `~/.config/undrudge/config.toml` to point at your atuin DB and
-Claude projects directory if they live somewhere unusual. The defaults
-work on a stock macOS/Linux install.
+Edit `~/.config/undrudge/config.toml` to point at your atuin DB, Claude
+projects directory, and Codex home if they live somewhere unusual. The Codex
+default follows `$CODEX_HOME` when set and otherwise uses `~/.codex`; both
+active and archived rollout sessions are scanned.
 
 ## How it works
 
-Three subcommands, one binary, no daemon.
+Three scheduled jobs, one binary, no daemon.
 
 ```
                 ~/.local/share/undrudge/undrudge.sqlite
@@ -78,7 +79,7 @@ Three subcommands, one binary, no daemon.
 ```
 
 ```bash
-undrudge gather              # ingest new Claude + shell activity (hourly)
+undrudge gather              # ingest new Claude + Codex + shell activity (hourly)
 undrudge analyze day         # daily digest → recs (24h trailing, regular)
 undrudge analyze week        # weekly meta digest → recs (7d trailing, --meta)
 undrudge analyze --dry-run day    # daily run, but write to dry-run/ (skip DB+hook)
@@ -138,8 +139,8 @@ A typical scheduler setup:
 
 ### macOS: prefer launchd, or grant cron Full Disk Access
 
-Cron on macOS will silently fail to read your atuin DB and Claude
-projects directory unless `/usr/sbin/cron` has Full Disk Access — the
+Cron on macOS will silently fail to read your atuin DB and agent-history
+directories unless `/usr/sbin/cron` has Full Disk Access — the
 symptom is `sqlite3.OperationalError: unable to open database file`
 even though the file is right there and owned by you. To grant it:
 System Settings → Privacy & Security → Full Disk Access → `+` →
@@ -224,8 +225,9 @@ no path in the system that stores unredacted text. Four mechanisms:
 
 - Pattern matching for common API keys, tokens, JWTs, password
   assignments, connection strings, private keys.
-- Path exclusion for `.env`, `.pem`, `.key`, `id_rsa*`, kubeconfigs,
-  etc. — the path is stored, the content never is.
+- Path exclusion for file-read/edit tool calls touching `.env`, `.pem`,
+  `.key`, `id_rsa*`, kubeconfigs, etc. — the path is stored, the content never
+  is. Nested Codex tool payloads are sanitized recursively.
 - Shannon-entropy detection for random-looking strings the patterns
   missed.
 - Contextual suppression near phrases like "here is the token" /
@@ -234,10 +236,9 @@ no path in the system that stores unredacted text. Four mechanisms:
 A parametrized test plants every supported secret type in a fixture and
 asserts none of them survive ingest. CI fails loud if anything leaks.
 
-If your environment uses a secret type that isn't covered, add a
-pattern to `src/undrudge/sanitize.py:SECRET_PATTERNS` and a test case
-to `tests/fixtures/secrets.txt` *before* running `undrudge gather`
-against real data.
+If your environment uses a secret type that isn't covered, add a pattern to
+`src/undrudge/sanitize.py` and a synthetic case under `tests/` *before* running
+`undrudge gather` against real data.
 
 ## Sandboxed Claude (optional)
 
@@ -270,7 +271,7 @@ TAIL_N=200 ./scripts/dev-test.sh   # more output
 
 ./scripts/dev-fresh.sh             # wipe scratch dirs, init a clean sandbox
 ./scripts/dev-fresh.sh doctor      # ...then run doctor in that sandbox
-./scripts/dev-fresh.sh gather
+./scripts/dev-fresh.sh gather      # empty synthetic source dirs; never real history
 ./scripts/dev-fresh.sh analyze --dry-run day
 ```
 

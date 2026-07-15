@@ -18,6 +18,7 @@ from . import (
     digest,
     events,
     ingest_claude,
+    ingest_codex,
     ingest_shell,
     llm,
     recommend,
@@ -99,8 +100,18 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     check("config readable", config.default_config_path().exists(),
           str(config.default_config_path()))
     check("db file present", cfg.paths.db.exists(), str(cfg.paths.db))
-    check("claude projects root", cfg.claude.projects_root.exists(),
-          str(cfg.claude.projects_root))
+    histories = _history_sources(cfg)
+    check(
+        "agent history available",
+        any(available for _, available, _ in histories),
+        f"claude={cfg.claude.projects_root}; "
+        f"codex={cfg.codex.home if cfg.codex else '(disabled)'}",
+    )
+    for label, available, detail in histories:
+        # Each provider is optional, so expose partial configuration without
+        # making doctor fail when the other provider remains healthy.
+        mark = "ok " if available else "-- "
+        print(f"  [{mark}] {label} (optional) — {detail}")
     check("atuin db", cfg.atuin.db.exists(), str(cfg.atuin.db))
 
     print("\nbinaries:")
@@ -143,6 +154,21 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     _check_gather_health(cfg, check)
 
     return 0 if ok else 1
+
+
+def _history_sources(cfg: config.Config) -> list[tuple[str, bool, str]]:
+    """Return provider-specific history availability for doctor output."""
+    codex_available = bool(
+        cfg.codex and any(root.exists() for root in cfg.codex.session_roots)
+    )
+    return [
+        ("claude history", cfg.claude.projects_root.exists(), str(cfg.claude.projects_root)),
+        (
+            "codex history",
+            codex_available,
+            str(cfg.codex.home) if cfg.codex else "disabled in this config",
+        ),
+    ]
 
 
 def _check_gather_health(cfg: config.Config, check) -> None:
@@ -460,7 +486,7 @@ def _cmd_digest(args: argparse.Namespace) -> int:
 
 
 def _cmd_gather(_args: argparse.Namespace) -> int:
-    """Ingest claude + shell activity. Each source runs independently; one
+    """Ingest Claude, Codex, and shell activity. Each source runs independently; one
     failing doesn't block the other. Failures are recorded as
     ``gather_failed`` events in events.jsonl so ``undrudge doctor`` can
     surface them — silent hourly failure is what let the WAL bug fester
@@ -469,6 +495,7 @@ def _cmd_gather(_args: argparse.Namespace) -> int:
     cfg = config.load()
     conn = store.open_db(cfg.paths.db)
     c: ingest_claude.ClaudeIngestStats | None = None
+    x: ingest_codex.CodexIngestStats | None = None
     s: ingest_shell.ShellIngestStats | None = None
     failures: list[tuple[str, BaseException]] = []
     gather_logger = logging.getLogger("undrudge.gather")
@@ -481,6 +508,14 @@ def _cmd_gather(_args: argparse.Namespace) -> int:
         except Exception as e:
             failures.append(("claude", e))
             gather_logger.exception("claude ingest failed")
+        if cfg.codex is not None:
+            try:
+                x = ingest_codex.ingest(
+                    conn, cfg.codex.home, fail_loud=cfg.privacy.fail_loud
+                )
+            except Exception as e:
+                failures.append(("codex", e))
+                gather_logger.exception("codex ingest failed")
         try:
             s = ingest_shell.ingest(
                 conn, cfg.atuin.db, fail_loud=cfg.privacy.fail_loud
@@ -501,6 +536,18 @@ def _cmd_gather(_args: argparse.Namespace) -> int:
         print(f"  sessions tracked    : {c.sessions_touched}")
         print(f"  bytes consumed      : {c.bytes_consumed}")
         print(f"  redaction drops     : {c.redaction_drops}")
+        print()
+    if x is not None:
+        print("codex:")
+        print(f"  files seen          : {x.files_seen}")
+        print(f"  files skipped       : {x.files_skipped}")
+        print(f"  lines read          : {x.lines_read}")
+        print(f"  lines skipped       : {x.lines_skipped}")
+        print(f"  rows inserted       : {x.rows_inserted}")
+        print(f"  rows updated        : {x.rows_updated}")
+        print(f"  sessions tracked    : {x.sessions_touched}")
+        print(f"  bytes consumed      : {x.bytes_consumed}")
+        print(f"  redaction drops     : {x.redaction_drops}")
         print()
     if s is not None:
         print("shell (atuin):")
@@ -535,6 +582,7 @@ def _cmd_gather(_args: argparse.Namespace) -> int:
             "failed_sources": [src for src, _ in failures],
             "shell_rows": s.rows_inserted if s is not None else None,
             "claude_rows": c.rows_inserted if c is not None else None,
+            "codex_rows": x.rows_inserted if x is not None else None,
         },
     )
     return 1 if failures else 0
@@ -588,10 +636,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--force", action="store_true", help="Overwrite existing config.")
     p_init.set_defaults(func=_cmd_init)
 
-    p_doctor = sub.add_parser("doctor", help="Check paths, atuin, claude CLI.")
+    p_doctor = sub.add_parser("doctor", help="Check paths, histories, atuin, and LLM CLI.")
     p_doctor.set_defaults(func=_cmd_doctor)
 
-    p_gather = sub.add_parser("gather", help="Ingest Claude + shell activity.")
+    p_gather = sub.add_parser("gather", help="Ingest Claude, Codex, and shell activity.")
     p_gather.set_defaults(func=_cmd_gather)
 
     p_dispatch = sub.add_parser(

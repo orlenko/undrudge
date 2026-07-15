@@ -1,12 +1,12 @@
 [project]
 name = "undrudge"
 version = "0.1.0"
-description = "Background watchman that finds what to automate in your Claude Code + shell activity."
+description = "Background watchman that finds what to automate in your Claude Code, Codex, and shell activity."
 requires-python = ">=3.12"
 authors = [{ name = "Vlad Orlenko", email = "vlad@orlenko.ca" }]
 readme = "README.md"
 license = { text = "MIT" }
-keywords = ["automation", "claude", "claude-code", "shell", "atuin", "productivity"]
+keywords = ["automation", "claude", "claude-code", "codex", "shell", "atuin", "productivity"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",

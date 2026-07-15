@@ -91,6 +91,26 @@ def test_resolve_evidence_refs_strips_dashes_in_handles(tmp_path: Path):
     assert (resolved, total) == (1, 1)
 
 
+def test_resolve_evidence_refs_filters_provider_aliases(tmp_path: Path):
+    conn = store.init(tmp_path / "u.sqlite")
+    conn.execute(
+        "INSERT INTO sessions(id, source, project, started_at, last_seen) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("codex-session", "codex", "/x", 1, 1),
+    )
+    conn.execute(
+        "INSERT INTO messages(id, session_id, seq, ts, role, text) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("c0de1234-feed-face-cafe-decadebabe00", "codex-session", 0, 1, "user", "hi"),
+    )
+    assert recommend.resolve_evidence_refs(
+        conn, [{"source": "codex", "external_id": "c0de1234"}]
+    ) == (1, 1)
+    assert recommend.resolve_evidence_refs(
+        conn, [{"source": "claude", "external_id": "c0de1234"}]
+    ) == (0, 1)
+
+
 def test_resolve_evidence_refs_treats_ambiguous_prefix_as_unresolved(
     tmp_path: Path,
 ):

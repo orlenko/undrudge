@@ -192,7 +192,7 @@ class Dispatcher:
             if src in ("atuin", "shell"):
                 q = ("SELECT cwd FROM commands WHERE "
                      "replace(external_id,'-','') LIKE ? LIMIT 5")
-            elif src in ("claude", "msg"):
+            elif src in ("claude", "codex", "msg", "message"):
                 q = ("SELECT s.project FROM messages m JOIN sessions s "
                      "ON m.session_id=s.id WHERE replace(m.id,'-','') LIKE ? LIMIT 5")
             elif src == "session":

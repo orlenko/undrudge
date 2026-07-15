@@ -48,6 +48,18 @@ def _run_check(cfg: cfg_mod.Config) -> list[tuple[str, bool, str]]:
     return results
 
 
+def test_history_sources_expose_missing_codex_when_claude_exists(tmp_path: Path):
+    cfg = _cfg(tmp_path)
+    cfg.claude.projects_root.mkdir()
+    cfg.codex = cfg_mod.Codex(home=tmp_path / "missing-codex")
+
+    availability = {
+        label: available for label, available, _ in cli._history_sources(cfg)
+    }
+
+    assert availability == {"claude history": True, "codex history": False}
+
+
 def test_doctor_fails_when_latest_run_still_failing(tmp_path: Path):
     cfg = _cfg(tmp_path)
     now = store.now_ms()
@@ -140,3 +152,32 @@ def test_gather_emits_gather_complete(
     assert len(completes) == 1
     assert completes[0]["failed_sources"] == []
     assert "shell_rows" in completes[0]
+
+
+def test_gather_isolates_codex_failure(
+    claude_projects: Path, atuin_db: Path, monkeypatch, tmp_path: Path
+):
+    cfg = _cfg(tmp_path)
+    cfg.claude = cfg_mod.Claude(projects_root=claude_projects)
+    cfg.codex = cfg_mod.Codex(home=tmp_path / "codex")
+    cfg.atuin = cfg_mod.Atuin(db=atuin_db)
+    store.init(cfg.paths.db).close()
+    monkeypatch.setattr(cfg_mod, "load", lambda path=None: cfg)
+
+    def fail_codex(*_args, **_kwargs):
+        raise RuntimeError("synthetic codex failure")
+
+    monkeypatch.setattr(cli.ingest_codex, "ingest", fail_codex)
+    rc = cli.main(["gather"])
+
+    assert rc == 1
+    events = [
+        json.loads(line)
+        for line in cfg.paths.events_log.read_text().splitlines()
+        if line.strip()
+    ]
+    complete = next(e for e in events if e.get("event") == "gather_complete")
+    assert complete["failed_sources"] == ["codex"]
+    assert complete["claude_rows"] is not None
+    assert complete["shell_rows"] is not None
+    assert complete["codex_rows"] is None

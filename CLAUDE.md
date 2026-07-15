@@ -1,6 +1,9 @@
-## Rationale History
+# Claude project instructions
 
-Prior agent session rationale (decisions, risks, open questions) is available in the
-agent-rationale repo at ~/.rationale/repo/. Search by file path, branch, commit SHA,
-date, or keyword when investigating bugs, picking up unfamiliar code, or continuing
-deferred work. Use `rationale search <query>` or search the JSON/Markdown files directly.
+Read and follow `AGENTS.md`; it is the shared repository guide for coding
+agents. Claude-specific rationale/a2a hooks may also be installed locally under
+`.claude/`, but they are personal integration state rather than project policy.
+
+The rationale CLI is not assumed to be on `PATH`. Use
+`~/.rationale/repo/bin/rationale search <query>` when the shared guide calls for
+prior decision history.
