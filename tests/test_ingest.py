@@ -377,3 +377,51 @@ def test_gather_no_redaction_failures_on_clean_fixtures(db, claude_projects: Pat
     # secrets are *redacted*, not failures. Failures would mean the
     # sanitizer threw — that's the catastrophic case.
     assert failures == 0
+
+
+def test_claude_session_count_excludes_other_providers(db, claude_projects: Path):
+    db.execute(
+        "INSERT INTO sessions(id, source, project) VALUES (?, 'codex', ?)",
+        ("synthetic-codex-session", "/Users/fake/repo"),
+    )
+
+    stats = ingest_claude.ingest(db, claude_projects)
+    expected = db.execute(
+        "SELECT COUNT(*) FROM sessions WHERE source = 'claude'"
+    ).fetchone()[0]
+
+    assert stats.sessions_touched == expected
+    assert db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == expected + 1
+
+
+def test_claude_ingest_tags_origin(db, tmp_path: Path):
+    """Rows from subagent transcripts (separate agent-*.jsonl files that
+    share the parent sessionId) must carry origin='subagent'; the main
+    conversation's rows carry origin='main'."""
+    root = tmp_path / "projects"
+    proj = root / "-Users-fake-repo"
+    sid = "11111111-2222-3333-4444-555555555555"
+    main_line = {
+        "type": "user", "uuid": "m-1", "sessionId": sid,
+        "timestamp": "2026-07-01T10:00:00.000Z", "cwd": "/Users/fake/repo",
+        "message": {"role": "user", "content": "please fix the tests"},
+    }
+    agent_line = {
+        "type": "user", "uuid": "sa-1", "sessionId": sid,
+        "isSidechain": True, "agentId": "abc123",
+        "timestamp": "2026-07-01T10:01:00.000Z", "cwd": "/Users/fake/repo",
+        "message": {"role": "user", "content": "You are a reviewer. Audit the diff."},
+    }
+    (proj / sid / "subagents").mkdir(parents=True)
+    (proj / f"{sid}.jsonl").write_text(json.dumps(main_line) + "\n")
+    (proj / sid / "subagents" / "agent-abc123.jsonl").write_text(
+        json.dumps(agent_line) + "\n"
+    )
+
+    ingest_claude.ingest(db, root)
+
+    origins = dict(
+        db.execute("SELECT id, origin FROM messages").fetchall()
+    )
+    assert origins["m-1#0"] == "main"
+    assert origins["sa-1#0"] == "subagent"

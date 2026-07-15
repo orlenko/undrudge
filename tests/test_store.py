@@ -59,6 +59,27 @@ def test_apply_schema_is_idempotent(tmp_path: Path):
     assert "reason" in _cols(conn, "recommendations")
 
 
+def test_migrate_adds_source_to_existing_sessions(tmp_path: Path):
+    p = tmp_path / "old-sessions.sqlite"
+    conn = sqlite3.connect(p)
+    conn.executescript(
+        """
+        CREATE TABLE sessions (
+          id TEXT PRIMARY KEY, project TEXT, started_at INTEGER, last_seen INTEGER
+        );
+        INSERT INTO sessions VALUES ('s1', '/repo', 1, 2);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    conn = store.open_db(p)
+    store.apply_schema(conn)
+    row = conn.execute("SELECT source, project FROM sessions WHERE id = 's1'").fetchone()
+    assert (row["source"], row["project"]) == ("claude", "/repo")
+
+
 def test_fresh_db_has_reason_column(tmp_path: Path):
     conn = store.init(tmp_path / "fresh.sqlite")
     assert "reason" in _cols(conn, "recommendations")
+    assert "source" in _cols(conn, "sessions")

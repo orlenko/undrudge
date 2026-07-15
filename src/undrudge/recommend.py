@@ -42,7 +42,7 @@ class Recommendation:
     rationale: str = ""
     evidence: list[Any] | None = None
     # Probe-phase: structured citations from the LLM. Each item is a dict
-    # with `source` ("atuin" / "claude"), `external_id` (8+ char prefix
+    # with `source` ("atuin" / "msg" / "session"), `external_id` (8+ char prefix
     # of the row id from the digest), and optional `note`. Validated
     # at write time; unresolved refs are kept as-is and counted for
     # tuning the digest format.
@@ -51,8 +51,8 @@ class Recommendation:
     # `target_class` axis but framed for undrudge's location-aware
     # analysis. "single_repo" = the rec belongs in one repo's scripts/;
     # "cross_cutting" = the rec belongs in ~/bin or a shared dotfile;
-    # "agent_global" = ~/.claude/commands or a similar agent-wide
-    # location. Defaults to "single_repo" when the LLM doesn't specify.
+    # "agent_global" = a provider-appropriate Claude/Codex agent surface.
+    # Defaults to "single_repo" when the LLM doesn't specify.
     target_scope: str = "single_repo"
     scope: str = "daily"
 
@@ -416,8 +416,8 @@ def resolve_evidence_refs(
 
     A ref is resolved if its ``external_id`` is a unique-prefix match
     against ``commands.external_id`` (for ``source == 'atuin'`` /
-    ``'shell'``) or ``messages.id`` (for ``source == 'claude'`` /
-    ``'msg'``). Returns ``(resolved, total_well_formed)``. Malformed
+    ``'shell'``) or ``messages.id`` (for ``source == 'msg'`` /
+    provider-specific aliases). Returns ``(resolved, total_well_formed)``. Malformed
     refs (missing source or id) are excluded from both counts.
 
     The 8-char handle the digest emits is normalized by stripping
@@ -437,26 +437,43 @@ def resolve_evidence_refs(
         ext_id = str(ext_id_raw).strip().replace("-", "")
         if not source or not ext_id:
             continue
+        params: tuple[str, ...]
         if source in ("atuin", "shell"):
             query = (
                 "SELECT 1 FROM commands "
                 "WHERE REPLACE(external_id, '-', '') LIKE ? LIMIT 2"
             )
-        elif source in ("claude", "msg", "message"):
+            params = (ext_id + "%",)
+        elif source in ("msg", "message"):
             query = (
                 "SELECT 1 FROM messages "
                 "WHERE REPLACE(id, '-', '') LIKE ? LIMIT 2"
             )
-        elif source in ("session", "claude-session"):
+            params = (ext_id + "%",)
+        elif source in ("claude", "codex"):
+            query = (
+                "SELECT 1 FROM messages m JOIN sessions s ON s.id = m.session_id "
+                "WHERE s.source = ? AND REPLACE(m.id, '-', '') LIKE ? LIMIT 2"
+            )
+            params = (source, ext_id + "%")
+        elif source == "session":
             query = (
                 "SELECT 1 FROM sessions "
                 "WHERE REPLACE(id, '-', '') LIKE ? LIMIT 2"
             )
+            params = (ext_id + "%",)
+        elif source in ("claude-session", "codex-session"):
+            provider = source.removesuffix("-session")
+            query = (
+                "SELECT 1 FROM sessions WHERE source = ? "
+                "AND REPLACE(id, '-', '') LIKE ? LIMIT 2"
+            )
+            params = (provider, ext_id + "%")
         else:
             # Unknown source — can't resolve, don't count toward total either.
             continue
         total += 1
-        hits = conn.execute(query, (ext_id + "%",)).fetchall()
+        hits = conn.execute(query, params).fetchall()
         if len(hits) == 1:
             resolved += 1
     return (resolved, total)

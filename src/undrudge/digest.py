@@ -153,6 +153,7 @@ def _render_sessions(
     rows = conn.execute(
         """SELECT m.session_id AS id,
                   s.project    AS project,
+                  COALESCE(s.source, 'claude') AS source,
                   MIN(m.ts)    AS first_ts,
                   MAX(m.ts)    AS last_ts,
                   COUNT(*)     AS msg_count,
@@ -191,30 +192,22 @@ def _render_sessions(
         )
 
         # First and last user prompts in this session within the window.
-        first_user = conn.execute(
-            """SELECT text FROM messages
-                WHERE session_id = ? AND role = 'user' AND ts BETWEEN ? AND ?
-                  AND text IS NOT NULL AND text != ''
-                ORDER BY seq ASC LIMIT 1""",
-            (sid, start, end),
-        ).fetchone()
-        last_user = conn.execute(
-            """SELECT text FROM messages
-                WHERE session_id = ? AND role = 'user' AND ts BETWEEN ? AND ?
-                  AND text IS NOT NULL AND text != ''
-                ORDER BY seq DESC LIMIT 1""",
-            (sid, start, end),
-        ).fetchone()
+        first_user = _pick_user_prompt(conn, sid, start, end, order="ASC")
+        last_user = _pick_user_prompt(conn, sid, start, end, order="DESC")
 
         out.append(
-            f"\n### session #{short} — {project} — "
+            f"\n### session #{short} [source={r['source']}] — {project} — "
             f"{duration} — {r['msg_count']} msgs"
         )
         out.append(f"- top tools: {tools_str}")
-        if first_user and first_user["text"]:
-            out.append(f"- first user: {_quote_one_line(first_user['text'])}")
-        if last_user and last_user["text"] and (not first_user or last_user["text"] != first_user["text"]):
-            out.append(f"- last user:  {_quote_one_line(last_user['text'])}")
+        if first_user:
+            author, payload = first_user
+            tag = "" if author == "you" else f" [{author}]"
+            out.append(f"- first user{tag}: {_quote_one_line(payload)}")
+        if last_user and (not first_user or last_user[1] != first_user[1]):
+            author, payload = last_user
+            tag = "" if author == "you" else f" [{author}]"
+            out.append(f"- last user{tag}:  {_quote_one_line(payload)}")
 
         # Shell commands run during this session's time range, attributed
         # by overlap. Best-effort temporal correlation, no fancy joins.
@@ -242,10 +235,35 @@ def _render_sessions(
     return "\n".join(out) + "\n"
 
 
+def _pick_user_prompt(
+    conn: sqlite3.Connection, sid: str, start: int, end: int, *, order: str
+) -> tuple[str, str] | None:
+    """First (order='ASC') or last (order='DESC') user message in the
+    window that carries semantic content, as (author, payload).
+
+    Skips protocol rows — task notifications and idle pings routinely
+    bookend a session and used to shadow the human's actual words.
+    """
+    assert order in ("ASC", "DESC")
+    cur = conn.execute(
+        f"""SELECT text, origin FROM messages
+             WHERE session_id = ? AND role = 'user' AND ts BETWEEN ? AND ?
+               AND text IS NOT NULL AND text != ''
+             ORDER BY seq {order}""",
+        (sid, start, end),
+    )
+    for row in cur:
+        author, payload = classify_user_text(row["text"], row["origin"])
+        if author != "protocol":
+            return author, payload
+    return None
+
+
 def _render_repeated_prompts(conn: sqlite3.Connection, start: int, end: int) -> str:
     rows = conn.execute(
         """SELECT m.id AS msg_id, m.session_id AS sid, m.text AS text,
-                  s.project AS project
+                  m.origin AS origin, s.project AS project,
+                  COALESCE(s.source, 'claude') AS source
              FROM messages m
              LEFT JOIN sessions s ON s.id = m.session_id
             WHERE m.role = 'user' AND m.ts BETWEEN ? AND ?
@@ -253,15 +271,24 @@ def _render_repeated_prompts(conn: sqlite3.Connection, start: int, end: int) -> 
         (start, end),
     ).fetchall()
 
-    # (msg_id, session_id, text, project) per skeleton
+    # (msg_id, session_id, payload, project) per skeleton. Clustering
+    # runs on the classified payload, not the raw text, so teammate
+    # messages group by what was said rather than by their envelope.
     buckets: dict[str, list[tuple[str, str, str, str | None]]] = defaultdict(list)
+    authors: dict[str, Counter[str]] = defaultdict(Counter)
+    providers: dict[str, Counter[str]] = defaultdict(Counter)
     for r in rows:
-        skeleton = canonicalize_prompt(r["text"])
+        author, payload = classify_user_text(r["text"], r["origin"])
+        if author == "protocol":
+            continue
+        skeleton = canonicalize_prompt(payload)
         if not skeleton or len(skeleton) < 12:
             continue
         buckets[skeleton].append(
-            (r["msg_id"], r["sid"], r["text"], r["project"])
+            (r["msg_id"], r["sid"], payload, r["project"])
         )
+        authors[skeleton][author] += 1
+        providers[skeleton][r["source"]] += 1
 
     repeats = sorted(
         ((sk, items) for sk, items in buckets.items() if len(items) >= MIN_REPEAT_COUNT),
@@ -275,6 +302,8 @@ def _render_repeated_prompts(conn: sqlite3.Connection, start: int, end: int) -> 
     for skeleton, items in repeats:
         sessions = sorted({sid for _, sid, _, _ in items})
         sample = items[0][2]
+        breakdown = _format_author_breakdown(authors[skeleton])
+        provider = _format_provider_breakdown(providers[skeleton])
         handles = _format_handles("msg", (mid for mid, _, _, _ in items))
         projects = _format_project_summary(p for _, _, _, p in items)
         prs: set[int] = set()
@@ -282,7 +311,7 @@ def _render_repeated_prompts(conn: sqlite3.Connection, start: int, end: int) -> 
             prs |= _extract_pr_numbers(text)
         pr_summary = _format_pr_summary(prs)
         out.append(
-            f"- ×{len(items)} across {len(sessions)} session(s)"
+            f"- ×{len(items)}{breakdown}{provider} across {len(sessions)} session(s)"
             f"{projects}{pr_summary}{handles}: `{_one_line(skeleton)[:160]}`"
         )
         out.append(f"  - sample: {_quote_one_line(sample)}")
@@ -368,6 +397,15 @@ def _format_author_breakdown(counts: Counter[str]) -> str:
     return f" ({parts})"
 
 
+def _format_provider_breakdown(counts: Counter[str]) -> str:
+    if not counts:
+        return ""
+    if len(counts) == 1:
+        return f" via {next(iter(counts))}"
+    parts = ", ".join(f"{provider}×{n}" for provider, n in counts.most_common())
+    return f" via {parts}"
+
+
 def _render_tool_ngrams(conn: sqlite3.Connection, start: int, end: int) -> str:
     rows = conn.execute(
         """SELECT session_id, tool_name FROM messages
@@ -442,6 +480,92 @@ def _render_error_chains(conn: sqlite3.Connection, start: int, end: int) -> str:
             if shown >= MAX_ERROR_CHAINS:
                 break
     return "\n".join(out) + "\n"
+
+
+# --------------------------------------------------------------------------
+# Prompt provenance
+# --------------------------------------------------------------------------
+
+# A growing share of role='user' rows are not typed by the human:
+# teammate messages relayed between Claude sessions, background-task
+# notifications, idle pings, harness reminders. The envelope is protocol
+# noise — clustering on it collapses every teammate exchange into a
+# handful of "<teammate-message ...>" buckets that crowd out the human
+# patterns. But the *payload* of a teammate message is real work: agents
+# re-sending the same briefing is exactly the drudgery this tool exists
+# to catch. So: unwrap and attribute, don't discard. Only messages with
+# no semantic content at all are classified 'protocol' and kept out of
+# prompt clustering.
+
+_RE_TEAMMATE_MSG = re.compile(
+    r"<teammate-message\b[^>]*>(.*?)</teammate-message>", re.DOTALL
+)
+_RE_SYSTEM_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+_RE_TASK_NOTIFICATION = re.compile(
+    r"<task-notification>.*?</task-notification>", re.DOTALL
+)
+# '[unhandled-content-type: image]', '[Image: source: /tmp/x.png]',
+# '[Image #24]', '[image]' — placeholders substituted for binary content.
+_RE_MEDIA_MARKER = re.compile(
+    r"\[(?:unhandled-content-type:[^\]]*|image\b[^\]]*)\]", re.IGNORECASE
+)
+
+# Inter-agent protocol payload types (JSON bodies inside
+# <teammate-message>) observed in real transcripts. Extend as new ones
+# show up. Unknown JSON payloads are kept — a repeated structured
+# hand-off between agents is still a pattern worth seeing.
+_PROTOCOL_MSG_TYPES = {
+    "idle_notification",
+    "shutdown_request",
+    "shutdown_response",
+    "plan_approval_request",
+    "plan_approval_response",
+}
+
+
+def _teammate_payload(body: str) -> str | None:
+    """Semantic content of one teammate-message body, or None for a
+    protocol ping (idle notification, shutdown handshake, ...)."""
+    body = body.strip()
+    if body.startswith("{"):
+        try:
+            d = json.loads(body)
+        except json.JSONDecodeError:
+            return body
+        if isinstance(d, dict) and d.get("type") in _PROTOCOL_MSG_TYPES:
+            return None
+    return body or None
+
+
+def classify_user_text(text: str, origin: str | None = None) -> tuple[str, str]:
+    """Attribute a user-role message; return (author, payload).
+
+    author ∈ {'you', 'teammate', 'agent', 'protocol'}. payload is the
+    text worth clustering on: the unwrapped message body for teammate
+    traffic, the text minus harness wrappers otherwise. 'protocol'
+    means no semantic content survived — skip the row. 'agent' marks
+    subagent transcripts (``origin='subagent'``), where the 'user'
+    prompt was authored by the orchestrating session, not the human —
+    still real drudgery signal, just framed differently.
+    """
+    bodies = _RE_TEAMMATE_MSG.findall(text)
+    if bodies:
+        payloads = [p for b in bodies if (p := _teammate_payload(b)) is not None]
+        if not payloads:
+            return "protocol", ""
+        # Everything outside the tags ("Another Claude session sent a
+        # message: ...") is harness framing; the extraction drops it.
+        return "teammate", "\n".join(payloads)
+
+    s = _RE_SYSTEM_REMINDER.sub(" ", text)
+    s = _RE_TASK_NOTIFICATION.sub(" ", s)
+    s = _RE_MEDIA_MARKER.sub(" ", s)
+    s = s.strip()
+    if not s:
+        return "protocol", ""
+    if origin == "subagent":
+        return "agent", s
+    return "you", s
 
 
 # --------------------------------------------------------------------------

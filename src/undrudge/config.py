@@ -45,6 +45,15 @@ class Claude:
 
 
 @dataclass
+class Codex:
+    home: Path
+
+    @property
+    def session_roots(self) -> tuple[Path, Path]:
+        return (self.home / "sessions", self.home / "archived_sessions")
+
+
+@dataclass
 class Atuin:
     db: Path
 
@@ -75,6 +84,10 @@ class Config:
     paths: Paths
     claude: Claude
     atuin: Atuin
+    # Programmatic/test configs opt in explicitly. default_config() enables
+    # the user's real Codex home; this default keeps isolated tests from ever
+    # wandering into it by accident.
+    codex: Codex | None = None
     llm: Llm = field(default_factory=Llm)
     output: Output = field(default_factory=Output)
     privacy: Privacy = field(default_factory=Privacy)
@@ -82,6 +95,7 @@ class Config:
 
 def default_config() -> Config:
     data = default_data_dir()
+    codex_home = _expand(os.environ.get("CODEX_HOME") or "~/.codex")
     return Config(
         paths=Paths(
             db=data / "undrudge.sqlite",
@@ -92,6 +106,7 @@ def default_config() -> Config:
         ),
         claude=Claude(projects_root=_expand("~/.claude/projects")),
         atuin=Atuin(db=_expand("~/.local/share/atuin/history.db")),
+        codex=Codex(home=codex_home),
     )
 
 
@@ -116,6 +131,10 @@ def load(path: Path | None = None) -> Config:
     if "claude" in raw:
         c = raw["claude"]
         cfg.claude = Claude(projects_root=_expand(c.get("projects_root", cfg.claude.projects_root)))
+    if "codex" in raw:
+        c = raw["codex"]
+        current_home = cfg.codex.home if cfg.codex else _expand("~/.codex")
+        cfg.codex = Codex(home=_expand(c.get("home", current_home)))
     if "atuin" in raw:
         a = raw["atuin"]
         cfg.atuin = Atuin(db=_expand(a.get("db", cfg.atuin.db)))
@@ -159,6 +178,10 @@ events_log  = "{cfg.paths.events_log}"
 
 [claude]
 projects_root = "{cfg.claude.projects_root}"
+
+[codex]
+# Both active sessions/ and archived_sessions/ are scanned below this home.
+home = "{cfg.codex.home if cfg.codex else _expand('~/.codex')}"
 
 [atuin]
 db = "{cfg.atuin.db}"

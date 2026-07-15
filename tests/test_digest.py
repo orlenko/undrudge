@@ -313,3 +313,123 @@ def test_render_repeated_commands_surfaces_cwd_summary(tmp_path: Path):
     assert "repo-a" in section
     assert "repo-b" in section
     conn.close()
+
+
+# --------------------------------------------------------------------------
+# Prompt provenance
+# --------------------------------------------------------------------------
+
+
+IDLE_PING = (
+    'Another Claude session sent a message: '
+    '<teammate-message teammate_id="aprs-sec" color="yellow"> '
+    '{"type":"idle_notification","from":"aprs-sec",'
+    '"timestamp":"2026-07-06T19:43:32.333Z","idleReason":"available"} '
+    '</teammate-message>  This came from another Claude session — '
+    'not typed by the user.'
+)
+TEAMMATE_BRIEF = (
+    '<teammate-message teammate_id="team-lead" summary="review briefing"> '
+    'Read the file /tmp/aprs-2303/p-ts.txt and follow the instructions '
+    'in it exactly. </teammate-message>'
+)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        IDLE_PING,
+        "<task-notification> <task-id>a1</task-id> <status>completed</status> </task-notification>",
+        "<system-reminder>The user named this session x.</system-reminder>",
+        "[unhandled-content-type: image]",
+        "[Image: source: /tmp/clipboard-2026.png]",
+    ],
+)
+def test_classify_protocol_messages_are_dropped(text: str):
+    author, payload = digest.classify_user_text(text)
+    assert author == "protocol"
+    assert payload == ""
+
+
+def test_classify_teammate_message_unwraps_payload():
+    author, payload = digest.classify_user_text(TEAMMATE_BRIEF)
+    assert author == "teammate"
+    assert payload.startswith("Read the file /tmp/aprs-2303/p-ts.txt")
+    assert "<teammate-message" not in payload
+    assert "team-lead" not in payload  # envelope attrs are gone
+
+
+def test_classify_mixed_ping_and_real_teammate_message():
+    """One user row can relay several teammate messages; pings among
+    them must not mask the real one."""
+    author, payload = digest.classify_user_text(IDLE_PING + "\n" + TEAMMATE_BRIEF)
+    assert author == "teammate"
+    assert "idle_notification" not in payload
+    assert "follow the instructions" in payload
+
+
+def test_classify_human_prompt_keeps_text_and_strips_wrappers():
+    author, payload = digest.classify_user_text(
+        "fix the flaky auth test <system-reminder>noise</system-reminder>"
+    )
+    assert author == "you"
+    assert payload == "fix the flaky auth test"
+
+
+def test_classify_subagent_origin_is_agent():
+    author, payload = digest.classify_user_text(
+        "You are a security reviewer. Audit the diff.", origin="subagent"
+    )
+    assert author == "agent"
+    assert payload.startswith("You are a security reviewer")
+
+
+def test_repeated_prompts_cluster_on_teammate_payload(tmp_path: Path):
+    """Teammate briefings cluster by what was said (labelled), idle
+    pings vanish, and first/last user lines skip protocol rows."""
+    conn = store.init(tmp_path / "p.sqlite")
+    sid = "cccccccc-1111-2222-3333-444444444444"
+    conn.execute(
+        "INSERT INTO sessions(id, project, started_at, last_seen) VALUES (?,?,?,?)",
+        (sid, "/repo/ops", 1_000_000_000_000, 1_000_000_300_000),
+    )
+    brief = (
+        '<teammate-message teammate_id="team-lead" summary="brief %d"> '
+        "Read the file /tmp/aprs-%d/p.txt and follow the instructions "
+        "in it exactly. </teammate-message>"
+    )
+    rows = [
+        # protocol bookends that used to shadow the human's words
+        ("n1#0", 0, "<task-notification> <task-id>t0</task-id> <status>started</status> </task-notification>", None),
+        ("h1#0", 1, "Fix the flaky auth test please", None),
+        ("b1#0", 2, brief % (1, 1), None),
+        ("b2#0", 3, brief % (2, 2), None),
+        ("b3#0", 4, brief % (3, 3), None),
+        ("i1#0", 5, IDLE_PING, None),
+        ("i2#0", 6, IDLE_PING, None),
+        # subagent briefing repeated by the orchestrator
+        ("s1#0", 7, "Review chunk 17 of the diff for bugs", "subagent"),
+        ("s2#0", 8, "Review chunk 28 of the diff for bugs", "subagent"),
+        ("n2#0", 9, "<task-notification> <task-id>t9</task-id> <status>completed</status> </task-notification>", None),
+    ]
+    for mid, seq, text, origin in rows:
+        conn.execute(
+            "INSERT INTO messages(id, session_id, seq, ts, role, text, origin) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (mid, sid, seq, 1_000_000_000_000 + seq * 1000, "user", text, origin),
+        )
+    md = digest.render_daily(conn, end_ts_ms=1_000_001_000_000, window_hours=24)
+
+    # The three briefings collapse to one labelled cluster on the payload.
+    assert "×3 [teammate]" in md
+    assert "read the file <path> and follow the instructions" in md
+    # The subagent fan-out clusters too, labelled as agent-authored.
+    assert "×2 [agent]" in md
+    # Envelope and protocol traffic never surface.
+    assert "<teammate-message" not in md
+    assert "idle_notification" not in md
+    assert "task-notification" not in md
+    # first/last user skip the protocol bookends.
+    assert "- first user: “Fix the flaky auth test please”" in md
+    assert "t9" not in md
+    conn.close()
