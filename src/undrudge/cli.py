@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import shutil
@@ -14,6 +15,7 @@ from pathlib import Path
 from . import (
     __version__,
     analyze,
+    browse,
     config,
     digest,
     events,
@@ -21,6 +23,7 @@ from . import (
     ingest_codex,
     ingest_shell,
     llm,
+    prune,
     recommend,
     scrub,
     store,
@@ -146,6 +149,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
             ).fetchone()[0]
             check("redaction failures clean", failures == 0,
                   f"{failures} entries — review table")
+            _report_retention(cfg, conn)
             conn.close()
         except sqlite3.DatabaseError as e:
             check("db opens", False, str(e))
@@ -154,6 +158,28 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     _check_gather_health(cfg, check)
 
     return 0 if ok else 1
+
+
+def _report_retention(cfg: config.Config, conn: sqlite3.Connection) -> None:
+    """Informational size/retention line. Not a pass/fail check — a big DB is
+    a disk-cost question, not a broken install."""
+    size = prune.human_bytes(prune.db_size_bytes(cfg.paths.db))
+    days = cfg.retention.days
+    policy = f"retention {days}d" if days > 0 else "retention off (keep everything)"
+    oldest_ms = prune.oldest_message_ms(conn)
+    oldest = (
+        datetime.fromtimestamp(oldest_ms / 1000, tz=UTC).strftime("%Y-%m-%d")
+        if oldest_ms else "none"
+    )
+    detail = f"{size}; {policy}; oldest message {oldest}"
+    if days > 0:
+        aged_msgs, aged_cmds = prune.count_aged(conn, prune.cutoff_for_days(days))
+        if aged_msgs or aged_cmds:
+            detail += (
+                f"; {aged_msgs + aged_cmds:,} row(s) past the cutoff "
+                f"(gather prunes up to {prune.GATHER_MAX_ROWS:,}/run)"
+            )
+    print(f"  [--] db size — {detail}")
 
 
 def _history_sources(cfg: config.Config) -> list[tuple[str, bool, str]]:
@@ -497,6 +523,8 @@ def _cmd_gather(_args: argparse.Namespace) -> int:
     c: ingest_claude.ClaudeIngestStats | None = None
     x: ingest_codex.CodexIngestStats | None = None
     s: ingest_shell.ShellIngestStats | None = None
+    p: prune.PruneStats | None = None
+    prune_error: BaseException | None = None
     failures: list[tuple[str, BaseException]] = []
     gather_logger = logging.getLogger("undrudge.gather")
     try:
@@ -523,6 +551,21 @@ def _cmd_gather(_args: argparse.Namespace) -> int:
         except Exception as e:
             failures.append(("shell", e))
             gather_logger.exception("shell ingest failed")
+
+        # Retention runs after ingest, capped so an unattended hourly job
+        # never turns into a long delete. It is not a "source": a broken
+        # prune must not make doctor report ingestion as failing, but it
+        # still gets an event, a stderr line, and a non-zero exit.
+        if cfg.retention.days > 0:
+            try:
+                p = prune.run(
+                    conn,
+                    cutoff_ms=prune.cutoff_for_days(cfg.retention.days),
+                    max_rows=prune.GATHER_MAX_ROWS,
+                )
+            except Exception as e:
+                prune_error = e
+                gather_logger.exception("prune failed")
     finally:
         conn.close()
 
@@ -556,6 +599,22 @@ def _cmd_gather(_args: argparse.Namespace) -> int:
         print(f"  rows dropped        : {s.rows_dropped}")
         print(f"  last ts (ns)        : {s.last_ts_ns}")
 
+    if p is not None:
+        print()
+        _print_prune_stats(p, cfg.retention.days)
+        events.record(
+            cfg.paths.events_log,
+            "prune_complete",
+            {
+                "cutoff_ms": p.cutoff_ms,
+                "retention_days": cfg.retention.days,
+                "messages": p.messages,
+                "commands": p.commands,
+                "sessions": p.sessions,
+                "truncated": p.truncated,
+            },
+        )
+
     for source, exc in failures:
         print(
             f"\nFAILED: {source} ingest — {type(exc).__name__}: {exc}",
@@ -585,7 +644,102 @@ def _cmd_gather(_args: argparse.Namespace) -> int:
             "codex_rows": x.rows_inserted if x is not None else None,
         },
     )
-    return 1 if failures else 0
+
+    if prune_error is not None:
+        print(
+            f"\nFAILED: prune — {type(prune_error).__name__}: {prune_error}",
+            file=sys.stderr,
+        )
+        events.record(
+            cfg.paths.events_log,
+            "prune_failed",
+            {
+                "error_type": type(prune_error).__name__,
+                "error_msg": str(prune_error),
+                "retention_days": cfg.retention.days,
+            },
+        )
+    return 1 if (failures or prune_error is not None) else 0
+
+
+def _print_prune_stats(p: prune.PruneStats, days: int, *, dry_run: bool = False) -> None:
+    cutoff = datetime.fromtimestamp(p.cutoff_ms / 1000, tz=UTC).strftime("%Y-%m-%d %H:%M")
+    verb = "would delete" if dry_run else "deleted"
+    print(f"retention ({days}d, cutoff {cutoff} UTC):")
+    print(f"  messages {verb:14}: {p.messages:,}")
+    print(f"  commands {verb:14}: {p.commands:,}")
+    print(f"  sessions {verb:14}: {p.sessions:,}")
+    if p.truncated:
+        print("  more to prune       : yes — run again (or `undrudge prune`) to continue")
+
+
+def _cmd_prune(args: argparse.Namespace) -> int:
+    """Apply retention by hand: bigger batches than gather takes, an optional
+    VACUUM, and a dry run that touches nothing."""
+    cfg = config.load()
+    days = args.days if args.days is not None else cfg.retention.days
+    if days <= 0:
+        print(
+            "retention is disabled (days = 0). Pass --days N to prune anyway.",
+            file=sys.stderr,
+        )
+        return 2
+
+    conn = store.open_db(cfg.paths.db)
+    before = prune.db_size_bytes(cfg.paths.db)
+    try:
+        store.apply_schema(conn)
+        stats = prune.run(
+            conn,
+            cutoff_ms=prune.cutoff_for_days(days),
+            dry_run=args.dry_run,
+            max_rows=args.max_rows,
+        )
+        _print_prune_stats(stats, days, dry_run=args.dry_run)
+        if args.vacuum and not args.dry_run:
+            print("\ncompacting (FTS optimize + VACUUM) — this can take a while…")
+            prune.compact(conn)
+    finally:
+        conn.close()
+
+    after = prune.db_size_bytes(cfg.paths.db)
+    print(f"\ndb size: {prune.human_bytes(before)} → {prune.human_bytes(after)}")
+    if not args.dry_run and not args.vacuum and stats.rows:
+        print("(freed pages stay in the file until `undrudge prune --vacuum`)")
+
+    if not args.dry_run:
+        events.record(
+            cfg.paths.events_log,
+            "prune_complete",
+            {
+                "cutoff_ms": stats.cutoff_ms,
+                "retention_days": days,
+                "messages": stats.messages,
+                "commands": stats.commands,
+                "sessions": stats.sessions,
+                "truncated": stats.truncated,
+                "vacuum": bool(args.vacuum),
+                "bytes_before": before,
+                "bytes_after": after,
+            },
+        )
+    return 0
+
+
+def _cmd_browse(args: argparse.Namespace) -> int:
+    cfg = config.load()
+    conn = store.open_db(cfg.paths.db)
+    try:
+        store.apply_schema(conn)
+        filters = browse.Filters(
+            status=args.status,
+            since_ms=_parse_since(args.since),
+            scope=args.scope,
+            limit=args.limit,
+        )
+        return browse.run_picker(conn, cfg, filters)
+    finally:
+        conn.close()
 
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
@@ -617,6 +771,121 @@ def _cmd_scrub(args: argparse.Namespace) -> int:
             "scrub_complete",
             {"commands_changed": stats.changed, "commands_scanned": stats.scanned},
         )
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Internal hooks the browse picker's fzf bindings call back into. Kept out of
+# the argparse subcommand table so `undrudge --help` stays the user's surface;
+# you never type these.
+# --------------------------------------------------------------------------
+
+_BROWSE_INTERNALS = (
+    "__browse-list",
+    "__browse-preview",
+    "__browse-act",
+    "__browse-copy",
+    "__browse-flip",
+    "__browse-help",
+)
+
+
+def _run_browse_internal(argv: list[str]) -> int:
+    sub = argv[0]
+    if sub == "__browse-help":
+        sys.stdout.write(browse.KEYS_HELP)
+        sys.stdout.write(
+            "\n" + "─" * 52 + "\n"
+            "  Press  q  to close this help and return to the picker.\n"
+        )
+        return 0
+
+    ap = argparse.ArgumentParser(prog=f"undrudge {sub}")
+    if sub == "__browse-list":
+        ap.add_argument("--status")
+        ap.add_argument("--since-ms", type=int, default=None)
+        ap.add_argument("--scope")
+        ap.add_argument("--limit", type=int, default=500)
+    if sub in ("__browse-preview", "__browse-copy"):
+        ap.add_argument("--id", required=True)
+    if sub in ("__browse-preview", "__browse-flip"):
+        ap.add_argument("--flag", required=True)
+    if sub == "__browse-act":
+        ap.add_argument("--action", required=True, choices=sorted(browse.ACTIONS))
+        ap.add_argument("--rows", required=True)
+    if sub == "__browse-copy":
+        ap.add_argument("--what", required=True, choices=["body", "path"])
+    args = ap.parse_args(argv[1:])
+
+    if sub == "__browse-flip":
+        flag = Path(args.flag)
+        current = ""
+        with contextlib.suppress(OSError):
+            current = flag.read_text(encoding="utf-8").strip()
+        flag.write_text("trail" if current != "trail" else "rec", encoding="utf-8")
+        return 0
+
+    cfg = config.load()
+    # No apply_schema here: these run on every keystroke of an already-running
+    # picker, against a db the parent process has already migrated.
+    conn = store.open_db(cfg.paths.db)
+    try:
+        if sub == "__browse-list":
+            filters = browse.Filters(
+                status=args.status,
+                since_ms=args.since_ms,
+                scope=args.scope,
+                limit=args.limit,
+            )
+            sys.stdout.write(browse.render_rows(browse.fetch_rows(conn, filters)))
+            return 0
+
+        if sub == "__browse-preview":
+            mode = "rec"
+            with contextlib.suppress(OSError):
+                mode = Path(args.flag).read_text(encoding="utf-8").strip() or "rec"
+            sys.stdout.write(
+                browse.preview_markdown(
+                    conn, args.id, mode=mode, events_log=cfg.paths.events_log
+                )
+            )
+            return 0
+
+        if sub == "__browse-copy":
+            row = conn.execute(
+                "SELECT body_path FROM recommendations WHERE id = ?", (args.id,)
+            ).fetchone()
+            if row is None or not row["body_path"]:
+                return 1
+            if args.what == "path":
+                payload = str(row["body_path"])
+            else:
+                _, payload = recommend.parse_rec_file(row["body_path"])
+            return 0 if browse.copy_to_clipboard(payload) else 1
+
+        return _browse_act(conn, cfg, args.action, args.rows)
+    finally:
+        conn.close()
+
+
+def _browse_act(conn, cfg: config.Config, action: str, rows_file: str) -> int:
+    ids = browse.ids_from_rows_file(rows_file)
+    if not ids:
+        return 0
+    _, needs_reason = browse.ACTIONS[action]
+    reason = None
+    if needs_reason:
+        titles = []
+        for rec_id in ids:
+            row = conn.execute(
+                "SELECT title FROM recommendations WHERE id = ?", (rec_id,)
+            ).fetchone()
+            titles.append(row["title"] if row else rec_id[:12])
+        proceed, reason = browse.prompt_reason(action, titles)
+        if not proceed:
+            return 0
+    for line in browse.apply_action(conn, cfg, ids, action, reason=reason):
+        print(line)
     return 0
 
 
@@ -719,6 +988,44 @@ def _build_parser() -> argparse.ArgumentParser:
     p_list.add_argument("--limit", default=200, type=int)
     p_list.set_defaults(func=_cmd_list)
 
+    p_browse = sub.add_parser(
+        "browse",
+        help="Triage recommendations in an fzf picker (needs fzf; glow optional).",
+    )
+    p_browse.add_argument("--since", default=None,
+                          help="Only recs newer than this (e.g. 7d, 24h, 2026-05-01).")
+    p_browse.add_argument(
+        "--status", default=None,
+        choices=["logged", "dismissed", "implemented", "dispatched", "rejected"],
+        help="Only this status. Default: everything, open recs first.",
+    )
+    p_browse.add_argument("--scope", default=None, choices=["daily", "weekly"])
+    p_browse.add_argument("--limit", default=500, type=int)
+    p_browse.set_defaults(func=_cmd_browse)
+
+    p_prune = sub.add_parser(
+        "prune",
+        help="Delete ingested rows older than the retention window.",
+    )
+    p_prune.add_argument(
+        "--days", type=int, default=None,
+        help="Retention window in days. Default: [retention].days from config.",
+    )
+    p_prune.add_argument(
+        "--dry-run", action="store_true",
+        help="Report what would be deleted; write nothing.",
+    )
+    p_prune.add_argument(
+        "--vacuum", action="store_true",
+        help="Also optimize the FTS indexes and VACUUM, handing freed pages "
+             "back to the filesystem. Slow, and needs room for a second copy.",
+    )
+    p_prune.add_argument(
+        "--max-rows", type=int, default=None,
+        help="Stop after deleting this many rows (default: no cap).",
+    )
+    p_prune.set_defaults(func=_cmd_prune)
+
     p_dismiss = sub.add_parser("dismiss", help="Mark a recommendation dismissed.")
     p_dismiss.add_argument("id", help="Full id or unique prefix.")
     p_dismiss.add_argument(
@@ -764,6 +1071,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    args_in = sys.argv[1:] if argv is None else argv
+    if args_in and args_in[0] in _BROWSE_INTERNALS:
+        return _run_browse_internal(args_in)
     parser = _build_parser()
     args = parser.parse_args(argv)
     _setup_logging(args.verbose)

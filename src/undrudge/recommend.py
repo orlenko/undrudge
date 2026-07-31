@@ -199,6 +199,36 @@ def render_markdown(rec: Recommendation, *, fingerprint: str, created: datetime)
     return head + f"\n# {rec.title.strip()}\n\n{rec.body_markdown.strip()}\n"
 
 
+def parse_rec_file(body_path: str | Path | None) -> tuple[dict[str, Any], str]:
+    """Split a rec markdown file into (frontmatter, body).
+
+    Reads the current ```json fence and the legacy YAML-style ``---`` fence
+    (recs written before that change). A missing, unreadable, or malformed
+    file degrades to ``({}, whatever text was there)`` — callers render what
+    they can rather than failing on a hand-edited rec.
+    """
+    if not body_path:
+        return {}, ""
+    try:
+        text = Path(body_path).read_text(encoding="utf-8")
+    except OSError:
+        return {}, ""
+    if text.startswith("```json\n"):
+        open_len, close = len("```json\n"), "\n```"
+    elif text.startswith("---\n"):
+        open_len, close = len("---\n"), "\n---"
+    else:
+        return {}, text
+    end = text.find(close, open_len)
+    if end < 0:
+        return {}, text
+    try:
+        fm = json.loads(text[open_len:end])
+    except json.JSONDecodeError:
+        return {}, text
+    return fm, text[end + len(close):].lstrip("\n")
+
+
 def normalize(rec: Recommendation) -> Recommendation:
     """Tighten free-form LLM output to known enums and trimmed strings."""
     form = rec.automation_form.strip().lower().replace(" ", "_") if rec.automation_form else "other"

@@ -80,6 +80,19 @@ class Privacy:
 
 
 @dataclass
+class Retention:
+    """How long ingested rows stay in the query cache.
+
+    The DB is rebuildable and every consumer reads a 24h/7d trailing window,
+    so old messages and commands are pure disk cost. ``days = 0`` keeps
+    everything. Pruning runs at the end of each ``gather``; recommendations
+    are never pruned.
+    """
+
+    days: int = 30
+
+
+@dataclass
 class Config:
     paths: Paths
     claude: Claude
@@ -91,6 +104,7 @@ class Config:
     llm: Llm = field(default_factory=Llm)
     output: Output = field(default_factory=Output)
     privacy: Privacy = field(default_factory=Privacy)
+    retention: Retention = field(default_factory=Retention)
 
 
 def default_config() -> Config:
@@ -152,6 +166,9 @@ def load(path: Path | None = None) -> Config:
     if "privacy" in raw:
         pr = raw["privacy"]
         cfg.privacy = Privacy(fail_loud=bool(pr.get("fail_loud", True)))
+    if "retention" in raw:
+        rt = raw["retention"]
+        cfg.retention = Retention(days=max(int(rt.get("days", cfg.retention.days)), 0))
     return cfg
 
 
@@ -208,4 +225,14 @@ on_write = ""
 # When true (default) any sanitization failure drops the row and logs to
 # redaction_failures. Never store unredacted text.
 fail_loud = true
+
+[retention]
+# Drop ingested messages and shell commands older than this many days at the
+# end of each `gather`. The DB is a rebuildable cache over your Claude/Codex
+# JSONL and atuin history, and analysis only ever reads a 24h/7d window — old
+# rows cost disk and buy nothing. Recommendations are never pruned.
+# 0 = keep everything. Run `undrudge prune --dry-run` to see what a change
+# would remove, and `undrudge prune --vacuum` to hand the freed pages back to
+# the filesystem.
+days = {cfg.retention.days}
 """

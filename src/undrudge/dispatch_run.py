@@ -39,20 +39,7 @@ class RunResult:
 
 def _parse_frontmatter(body_path: str) -> tuple[dict, str]:
     """Pull the leading ```json fence + body from a rec markdown file."""
-    try:
-        text = Path(body_path).read_text(encoding="utf-8")
-    except OSError:
-        return {}, ""
-    if not text.startswith("```json\n"):
-        return {}, text
-    end = text.find("\n```", len("```json\n"))
-    if end < 0:
-        return {}, text
-    try:
-        fm = json.loads(text[len("```json\n"):end])
-    except json.JSONDecodeError:
-        return {}, text
-    return fm, text[end + len("\n```"):].lstrip("\n")
+    return recommend.parse_rec_file(body_path)
 
 
 class Dispatcher:
