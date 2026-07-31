@@ -89,6 +89,7 @@ undrudge analyze --dry-run day    # daily run, but write to dry-run/ (skip DB+ho
 undrudge digest --window 24h --out -   # render a digest only (no LLM call)
 undrudge list                # show recommendations
 undrudge browse              # triage them in a picker (fzf; see below)
+undrudge copy [<id>]         # rec → clipboard, ready to paste into an agent chat
 undrudge dismiss <id> [--reason ...]    # mark a rec dismissed (full id or unique prefix)
 undrudge implement <id> [--reason ...]  # mark a rec implemented
 undrudge mark <id> <status> [--reason ...]   # set any status: dispatched, rejected, …
@@ -212,7 +213,7 @@ undrudge browse --since 7d --scope weekly
                 Tab multi-selects; the action applies to the whole selection
   read          Enter / ^O open full-screen in less · ^T flip to the audit
                 trail for that rec · Shift-↑/↓ scroll · ? toggle the pane
-  yank          ^Y copy the rec's markdown · ^P copy its path
+  yank          ^Y copy the rec as a hand-off · ^P copy its path
   navigate      ⌥g / ⌥G newest / oldest · ^b / ^f page · ^R reload
   ^H help       Esc quit
 ```
@@ -236,6 +237,33 @@ and events-log path as `undrudge dismiss`. Quitting leaves no state
 behind. Requires [`fzf`](https://github.com/junegunn/fzf); install
 [`glow`](https://github.com/charmbracelet/glow) too if you want the
 preview rendered rather than raw.
+
+### Handing a rec to an implementing session
+
+`^Y` in the picker — or `undrudge copy` from any shell — puts the rec on
+the clipboard as a **hand-off**: the recommendation verbatim, the
+directories its evidence came from, what to check before building it, and
+the `undrudge implement` / `undrudge dismiss` lines (id already filled in)
+that close the loop. Paste it into whatever session is going to do the
+work.
+
+```bash
+undrudge copy               # pick from a list, copy the one you choose
+undrudge copy 20fc          # any unique id prefix — four characters usually do
+undrudge copy 20fc --print  # to stdout instead (pipe it, or read it here)
+undrudge copy 20fc --what path   # or: body, id
+```
+
+No id opens a one-shot picker with the same preview as `browse`, so the id
+never has to make the trip through your eyes and back into another
+terminal. With an id, prefix matching means you're typing four characters,
+not sixty-four — and an ambiguous prefix tells you so instead of guessing.
+Without a clipboard tool on PATH (`pbcopy`, `wl-copy`, `xclip`, `xsel`)
+it prints the hand-off rather than silently dropping it.
+
+This is the same idea as a dispatch brief, minus everything that only
+exists inside a synced repo clone — use `dispatch` when you want briefs
+routed to clones automatically, `copy` when you're driving.
 
 ## Retention
 

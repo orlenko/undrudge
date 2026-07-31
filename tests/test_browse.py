@@ -485,6 +485,191 @@ def test_real_fzf_accepts_every_binding(monkeypatch, tmp_path: Path):
     assert proc.returncode in (0, 1), proc.stderr
 
 
+# --------------------------------------------------------------------------
+# Copying a rec out to an implementing session
+# --------------------------------------------------------------------------
+
+
+def _seed_with_evidence(cfg) -> str:
+    """A rec whose evidence_refs resolve to two directories."""
+    conn = store.open_db(cfg.paths.db)
+    try:
+        store.apply_schema(conn)
+        conn.execute(
+            "INSERT INTO commands(source, external_id, ts, command, cwd) "
+            "VALUES ('atuin', 'aaaa1111-2222-3333-4444-555555555555', 1, 'ls', ?)",
+            ("/Users/fake/repo",),
+        )
+        conn.execute(
+            "INSERT INTO sessions(id, source, project, started_at, last_seen) "
+            "VALUES ('bbbb2222-3333-4444-5555-666666666666', 'claude', ?, 1, 1)",
+            ("/Users/fake/other",),
+        )
+        rec_id = _write_rec(
+            conn, cfg.paths.recs_dir, "Wrap find/grep", "find <str>",
+            confidence="high", automation_form="slash_command",
+            evidence_refs=[
+                {"source": "atuin", "external_id": "aaaa1111"},
+                {"source": "session", "external_id": "bbbb2222"},
+                {"source": "atuin", "external_id": "no"},  # too short, ignored
+            ],
+        )
+    finally:
+        conn.close()
+    return rec_id
+
+
+def test_handoff_carries_the_rec_its_evidence_and_the_way_to_close_it(
+    monkeypatch, tmp_path: Path
+):
+    cfg = _prep_cfg(monkeypatch, tmp_path)
+    rec_id = _seed_with_evidence(cfg)
+    conn = store.open_db(cfg.paths.db)
+    try:
+        rec = recommend.find_by_id_prefix(conn, rec_id)[0]
+        out = recommend.render_handoff(conn, rec)
+    finally:
+        conn.close()
+
+    assert rec_id[:12] in out
+    assert "Wrap find/grep" in out
+    assert "Because you did it seven times." in out       # the rec, verbatim
+    assert "confidence high" in out and "form slash_command" in out
+    assert "/Users/fake/repo" in out and "/Users/fake/other" in out
+    # The closing commands carry the id, so the session can flip the status.
+    assert f"undrudge implement {rec_id[:12]}" in out
+    assert f"undrudge dismiss   {rec_id[:12]}" in out
+
+
+def test_payload_for_covers_each_kind(monkeypatch, tmp_path: Path):
+    cfg = _prep_cfg(monkeypatch, tmp_path)
+    ids = _seed(cfg)
+    conn = store.open_db(cfg.paths.db)
+    try:
+        rec = recommend.find_by_id_prefix(conn, ids["logged"])[0]
+        handoff = browse.payload_for(conn, rec, "handoff")
+        body = browse.payload_for(conn, rec, "body")
+        path = browse.payload_for(conn, rec, "path")
+        short = browse.payload_for(conn, rec, "id")
+    finally:
+        conn.close()
+
+    assert handoff.startswith("# undrudge recommendation")
+    assert body.startswith("# Wrap find/grep")
+    assert not body.startswith("```json")
+    assert Path(path).exists()
+    assert short == ids["logged"][:12]
+
+
+def test_copy_takes_a_short_prefix_and_writes_the_clipboard(monkeypatch, tmp_path: Path, capsys):
+    cfg = _prep_cfg(monkeypatch, tmp_path)
+    ids = _seed(cfg)
+    copied: list[str] = []
+    monkeypatch.setattr(browse, "copy_to_clipboard",
+                        lambda text: copied.append(text) or True)
+
+    assert cli.main(["copy", ids["logged"][:4]]) == 0
+
+    assert copied[0].startswith("# undrudge recommendation")
+    out = capsys.readouterr().out
+    assert f"copied {ids['logged'][:12]}" in out
+    assert "Wrap find/grep" in out
+
+
+def test_copy_reports_an_ambiguous_or_missing_prefix(monkeypatch, tmp_path: Path, capsys):
+    cfg = _prep_cfg(monkeypatch, tmp_path)
+    _seed(cfg)
+    conn = store.open_db(cfg.paths.db)
+    try:
+        # Two recs whose ids share a prefix, so the ambiguity is real.
+        for suffix in ("a", "b"):
+            conn.execute(
+                "INSERT INTO recommendations(id, scope, title, signature, "
+                "body_path, evidence, status, created_at, updated_at) "
+                "VALUES (?, 'daily', ?, 's', '/x.md', '[]', 'logged', 1, 1)",
+                (f"dead{suffix}" + "0" * 59, f"Rec {suffix}"),
+            )
+    finally:
+        conn.close()
+
+    assert cli.main(["copy", "dead"]) == 1
+    assert "matches 2 recs" in capsys.readouterr().err
+    assert cli.main(["copy", "zzzz"]) == 1
+    assert "no recommendation matched" in capsys.readouterr().err
+
+
+def test_copy_prints_when_asked_or_when_no_clipboard_exists(monkeypatch, tmp_path: Path, capsys):
+    cfg = _prep_cfg(monkeypatch, tmp_path)
+    ids = _seed(cfg)
+
+    assert cli.main(["copy", ids["logged"][:6], "--print"]) == 0
+    printed = capsys.readouterr().out
+    assert printed.startswith("# undrudge recommendation")
+
+    # No pbcopy/xclip/wl-copy anywhere: print rather than swallow it.
+    monkeypatch.setattr(browse, "copy_to_clipboard", lambda _text: False)
+    assert cli.main(["copy", ids["logged"][:6]]) == 0
+    captured = capsys.readouterr()
+    assert "no clipboard tool found" in captured.err
+    assert captured.out.startswith("# undrudge recommendation")
+
+
+def test_copy_without_an_id_uses_the_picker(monkeypatch, tmp_path: Path, capsys):
+    cfg = _prep_cfg(monkeypatch, tmp_path)
+    ids = _seed(cfg)
+    copied: list[str] = []
+    monkeypatch.setattr(browse.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(browse, "pick_one", lambda _conn, _filters: ids["dismissed"])
+    monkeypatch.setattr(browse, "copy_to_clipboard",
+                        lambda text: copied.append(text) or True)
+
+    assert cli.main(["copy"]) == 0
+    assert ids["dismissed"][:12] in copied[0]
+
+    # Quitting the picker copies nothing and isn't an error.
+    copied.clear()
+    monkeypatch.setattr(browse, "pick_one", lambda _conn, _filters: None)
+    assert cli.main(["copy"]) == 0
+    assert copied == []
+
+
+def test_copy_without_an_id_or_fzf_explains_itself(monkeypatch, tmp_path: Path, capsys):
+    cfg = _prep_cfg(monkeypatch, tmp_path)
+    _seed(cfg)
+    monkeypatch.setattr(cli.shutil, "which", lambda _name: None)
+
+    assert cli.main(["copy"]) == 2
+    err = capsys.readouterr().err
+    assert "fzf isn't installed" in err
+    assert "undrudge copy 7f3a" in err  # shows the prefix form instead
+
+
+def test_pick_one_returns_the_chosen_id(monkeypatch, tmp_path: Path):
+    cfg = _prep_cfg(monkeypatch, tmp_path)
+    ids = _seed(cfg)
+    monkeypatch.setattr(browse.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    class R:
+        returncode = 0
+        stdout = ""
+
+    def fake_run(cmd, **kwargs):
+        R.stdout = kwargs["input"].splitlines()[1] + "\n"  # "user picks" row 2
+        R.cmd = cmd
+        return R
+
+    monkeypatch.setattr(browse.subprocess, "run", fake_run)
+    conn = store.open_db(cfg.paths.db)
+    try:
+        picked = browse.pick_one(conn, browse.Filters())
+    finally:
+        conn.close()
+
+    assert picked in ids.values()
+    assert "--multi" not in R.cmd  # one rec, not a selection
+
+
 def test_picker_falls_back_to_cat_without_glow(monkeypatch):
     monkeypatch.setattr(browse.shutil, "which", lambda name: None if name == "glow" else "/bin/x")
     assert browse._renderer("80") == "cat"

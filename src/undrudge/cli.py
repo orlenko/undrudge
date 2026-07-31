@@ -726,6 +726,61 @@ def _cmd_prune(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_copy(args: argparse.Namespace) -> int:
+    """Put a rec on the clipboard, ready to paste into an implementing session.
+
+    With no id it opens a one-shot picker, so the id never has to make the trip
+    through your eyes and back into another terminal. With an id, any unique
+    prefix works — four characters usually do.
+    """
+    cfg = config.load()
+    conn = store.open_db(cfg.paths.db)
+    try:
+        store.apply_schema(conn)
+        if args.id:
+            matches = recommend.find_by_id_prefix(conn, args.id)
+            if not matches:
+                print(f"no recommendation matched id prefix {args.id!r}", file=sys.stderr)
+                return 1
+            if len(matches) > 1:
+                print(
+                    f"id prefix {args.id!r} matches {len(matches)} recs "
+                    f"({[m['id'][:12] for m in matches]}) — add a character",
+                    file=sys.stderr,
+                )
+                return 1
+            rec = matches[0]
+        else:
+            if not shutil.which("fzf"):
+                print(
+                    "undrudge copy: no id given and fzf isn't installed.\n"
+                    "  pass an id prefix (`undrudge copy 7f3a`) or install fzf "
+                    "to pick from a list.",
+                    file=sys.stderr,
+                )
+                return 2
+            rec_id = browse.pick_one(conn, browse.Filters(limit=args.limit))
+            if not rec_id:
+                return 0  # cancelled, or nothing to pick
+            rec = recommend.find_by_id_prefix(conn, rec_id)[0]
+
+        payload = browse.payload_for(conn, rec, args.what)
+    finally:
+        conn.close()
+
+    if args.print:
+        sys.stdout.write(payload if payload.endswith("\n") else payload + "\n")
+        return 0
+    if browse.copy_to_clipboard(payload):
+        print(f"copied {rec['id'][:12]} ({args.what}, {len(payload)} chars): {rec['title']}")
+        return 0
+    # No pbcopy/xclip/wl-copy: printing beats swallowing what you asked for.
+    print("no clipboard tool found (pbcopy/wl-copy/xclip/xsel) — printing instead",
+          file=sys.stderr)
+    sys.stdout.write(payload if payload.endswith("\n") else payload + "\n")
+    return 0
+
+
 def _cmd_browse(args: argparse.Namespace) -> int:
     cfg = config.load()
     conn = store.open_db(cfg.paths.db)
@@ -814,7 +869,7 @@ def _run_browse_internal(argv: list[str]) -> int:
         ap.add_argument("--action", required=True, choices=sorted(browse.ACTIONS))
         ap.add_argument("--rows", required=True)
     if sub == "__browse-copy":
-        ap.add_argument("--what", required=True, choices=["body", "path"])
+        ap.add_argument("--what", required=True, choices=list(browse.PAYLOADS))
     args = ap.parse_args(argv[1:])
 
     if sub == "__browse-flip":
@@ -853,14 +908,11 @@ def _run_browse_internal(argv: list[str]) -> int:
 
         if sub == "__browse-copy":
             row = conn.execute(
-                "SELECT body_path FROM recommendations WHERE id = ?", (args.id,)
+                "SELECT * FROM recommendations WHERE id = ?", (args.id,)
             ).fetchone()
-            if row is None or not row["body_path"]:
+            if row is None:
                 return 1
-            if args.what == "path":
-                payload = str(row["body_path"])
-            else:
-                _, payload = recommend.parse_rec_file(row["body_path"])
+            payload = browse.payload_for(conn, dict(row), args.what)
             return 0 if browse.copy_to_clipboard(payload) else 1
 
         return _browse_act(conn, cfg, args.action, args.rows)
@@ -1002,6 +1054,30 @@ def _build_parser() -> argparse.ArgumentParser:
     p_browse.add_argument("--scope", default=None, choices=["daily", "weekly"])
     p_browse.add_argument("--limit", default=500, type=int)
     p_browse.set_defaults(func=_cmd_browse)
+
+    p_copy = sub.add_parser(
+        "copy",
+        help="Copy a rec to the clipboard, ready to paste into an "
+             "implementing session. No id = pick from a list.",
+    )
+    p_copy.add_argument(
+        "id", nargs="?", default=None,
+        help="Full id or any unique prefix (four characters usually do). "
+             "Omit to pick from a list (needs fzf).",
+    )
+    p_copy.add_argument(
+        "--what", default="handoff", choices=list(browse.PAYLOADS),
+        help="handoff (default) = the rec plus its evidence locations and the "
+             "commands that close the loop; body = the rec markdown alone; "
+             "path = its file; id = the short fingerprint.",
+    )
+    p_copy.add_argument(
+        "--print", dest="print", action="store_true",
+        help="Write to stdout instead of the clipboard.",
+    )
+    p_copy.add_argument("--limit", default=500, type=int,
+                        help="How many recs the picker offers. Default 500.")
+    p_copy.set_defaults(func=_cmd_copy)
 
     p_prune = sub.add_parser(
         "prune",

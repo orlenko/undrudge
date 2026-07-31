@@ -87,7 +87,11 @@ undrudge browse — interactive keys
     ?              toggle the preview pane on / off
 
   yank
-    Ctrl-Y         copy the rec's markdown to the clipboard
+    Ctrl-Y         copy the rec as a hand-off — the rec verbatim, where its
+                   evidence came from, and the `undrudge implement/dismiss`
+                   lines that close the loop. Paste it straight into the
+                   session you want to build it. (`undrudge copy <id>` does
+                   the same from a shell.)
     Ctrl-P         copy the rec's file path
 
   navigate
@@ -402,6 +406,28 @@ def prompt_reason(action: str, titles: list[str]) -> tuple[bool, str | None]:
     return True, reason or None
 
 
+# What `undrudge copy` / ^Y can put on the clipboard.
+PAYLOADS = ("handoff", "body", "path", "id")
+
+
+def payload_for(conn, rec: dict[str, Any], what: str) -> str:
+    """The clipboard text for one rec.
+
+    ``handoff`` is the default everywhere: the rec verbatim plus where its
+    evidence came from and the commands that close the loop — the thing you
+    paste into an implementing session. ``body`` is the rec markdown alone,
+    ``path`` its file, ``id`` the short fingerprint.
+    """
+    if what == "path":
+        return str(rec.get("body_path") or "")
+    if what == "id":
+        return rec["id"][:12]
+    if what == "body":
+        _, body = recommend.parse_rec_file(rec.get("body_path"))
+        return body or ""
+    return recommend.render_handoff(conn, rec)
+
+
 def copy_to_clipboard(text: str) -> bool:
     """Best-effort clipboard write. False when no clipboard tool is around."""
     for cmd in (
@@ -455,6 +481,58 @@ def _renderer(width: str) -> str:
         # fzf preview or a pipe into less). CLICOLOR_FORCE=1 keeps the colour.
         return f"CLICOLOR_FORCE=1 glow -s dark -w {width} -"
     return "cat"
+
+
+def pick_one(conn, filters: Filters) -> str | None:
+    """Choose a single rec and return its id (None if the user quits).
+
+    The narrow cousin of ``run_picker``: same rows, same preview, no actions.
+    It exists so ``undrudge copy`` never makes you read an id off one terminal
+    and retype it into another — the thing you're looking at is the thing you
+    get.
+    """
+    if not shutil.which("fzf"):
+        return None
+    rows = fetch_rows(conn, filters)
+    if not rows:
+        return None
+
+    fd, flag = tempfile.mkstemp(prefix="undrudge-pick-")
+    os.close(fd)
+    Path(flag).write_text("rec", encoding="utf-8")
+    preview = (
+        f"{_self_cmd()} __browse-preview --id {{1}} --flag {shlex.quote(flag)} "
+        f"| {_renderer('${FZF_PREVIEW_COLUMNS:-90}')}"
+    )
+    fzf = [
+        "fzf",
+        "--ansi",
+        "--delimiter", "\t",
+        "--with-nth", "2",
+        "--no-sort",
+        "--layout", "reverse",
+        "--border",
+        "--prompt", "copy> ",
+        "--header", "pick a recommendation  ·  Enter copy · Esc cancel",
+        "--preview", preview,
+        "--preview-window", "right,60%,wrap,border-left",
+        "--bind", "?:toggle-preview",
+        "--bind", "shift-up:preview-up",
+        "--bind", "shift-down:preview-down",
+        "--bind", "home:first,alt-g:first",
+        "--bind", "end:last,alt-G:last",
+        "--bind", "ctrl-f:page-down,ctrl-b:page-up",
+    ]
+    try:
+        result = subprocess.run(
+            fzf, input=render_rows(rows), text=True, capture_output=True
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(flag)
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return result.stdout.rstrip("\n").split("\t", 1)[0]
 
 
 def run_picker(conn, cfg: config_mod.Config, filters: Filters) -> int:
@@ -531,7 +609,7 @@ def run_picker(conn, cfg: config_mod.Config, filters: Filters) -> int:
         "--bind", f"alt-a:execute-silent({act('implement')})+reload({list_cmd})+clear-selection+refresh-preview+bell",
         "--bind", f"ctrl-l:execute-silent({act('reopen')})+reload({list_cmd})+clear-selection+refresh-preview+bell",
         "--bind", f"alt-l:execute-silent({act('reopen')})+reload({list_cmd})+clear-selection+refresh-preview+bell",
-        "--bind", f"ctrl-y:execute-silent({copy('body')})+bell",
+        "--bind", f"ctrl-y:execute-silent({copy('handoff')})+bell",
         "--bind", f"ctrl-p:execute-silent({copy('path')})+bell",
         "--bind", f"ctrl-t:execute-silent({s} __browse-flip --flag {flag_q})+refresh-preview",
         "--bind", f"ctrl-r:reload({list_cmd})",
