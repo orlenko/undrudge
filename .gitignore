@@ -9,7 +9,6 @@ __pycache__/
 dist/
 build/
 *.egg-info/
-.a2a/
 .DS_Store
 
 # The real dispatch prototype config + plist name sensitive internal
