@@ -39,7 +39,10 @@ uv run undrudge --help
 ```
 
 Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/) (a single
-Rust binary).
+Rust binary). No Python dependencies. `undrudge browse` additionally
+wants [`fzf`](https://github.com/junegunn/fzf) (required) and
+[`glow`](https://github.com/charmbracelet/glow) (optional, for rendered
+previews); every other command runs without them.
 
 ## Setup
 
@@ -85,9 +88,12 @@ undrudge analyze week        # weekly meta digest → recs (7d trailing, --meta)
 undrudge analyze --dry-run day    # daily run, but write to dry-run/ (skip DB+hook)
 undrudge digest --window 24h --out -   # render a digest only (no LLM call)
 undrudge list                # show recommendations
+undrudge browse              # triage them in a picker (fzf; see below)
+undrudge copy [<id>]         # rec → clipboard, ready to paste into an agent chat
 undrudge dismiss <id> [--reason ...]    # mark a rec dismissed (full id or unique prefix)
 undrudge implement <id> [--reason ...]  # mark a rec implemented
 undrudge mark <id> <status> [--reason ...]   # set any status: dispatched, rejected, …
+undrudge prune [--dry-run] [--vacuum]   # apply retention to the db (see below)
 undrudge dispatch run [--dry-run]    # route logged recs to repo clones as briefs (see below)
 undrudge dispatch status             # show logged recs + their dispatch state
 ```
@@ -187,6 +193,111 @@ across 3 sessions this week. ...
 
 To dismiss: edit the frontmatter `status: dismissed`, or run `undrudge
 dismiss <id>`.
+
+## Browsing (`undrudge browse`)
+
+`list` answers "what's there"; `browse` answers "what do I do about it".
+It's an fzf picker over the same recs, files, and statuses — recs on the
+left, the rendered rec on the right, and the actions that fit *that rec's
+status* printed at the top of the preview.
+
+```bash
+undrudge browse                      # everything, open recs first
+undrudge browse --status logged      # just the queue
+undrudge browse --since 7d --scope weekly
+```
+
+```
+  triage        ^A implement · ^D dismiss · ^X reject · ^L reopen
+                (also ⌥a ⌥d ⌥x ⌥l, when the Ctrl chord is taken by tmux)
+                Tab multi-selects; the action applies to the whole selection
+  read          Enter / ^O open full-screen in less · ^T flip to the audit
+                trail for that rec · Shift-↑/↓ scroll · ? toggle the pane
+  yank          ^Y copy the rec as a hand-off · ^P copy its path
+  navigate      ⌥g / ⌥G newest / oldest · ^b / ^f page · ^R reload
+  ^H help       Esc quit
+```
+
+`^D` and `^X` prompt for a reason before flipping anything — that prompt
+*is* the confirmation, and the reason is the part that pays: it lands in
+the rec's frontmatter and `events.jsonl`, appears in the next analyze
+prompt under "do not re-propose variants", and feeds the write-time
+dedupe gate. Dismissing with *"we don't want a background daemon"* buys
+silence on that whole idea. `^A` and `^L` are instant (no prompt) and
+reversible.
+
+Acting on a rec drops it out of the open block and slides the next one
+under your cursor, so a triage pass is `^D` · reason · `^D` · reason
+without touching the arrow keys. Closed recs stay in the list, dimmed and
+searchable — type `dismissed` to review what you said no to, `^L` to take
+one back.
+
+Nothing new is persisted: every key routes through the same `set_status`
+and events-log path as `undrudge dismiss`. Quitting leaves no state
+behind. Requires [`fzf`](https://github.com/junegunn/fzf); install
+[`glow`](https://github.com/charmbracelet/glow) too if you want the
+preview rendered rather than raw.
+
+### Handing a rec to an implementing session
+
+`^Y` in the picker — or `undrudge copy` from any shell — puts the rec on
+the clipboard as a **hand-off**: the recommendation verbatim, the
+directories its evidence came from, what to check before building it, and
+the `undrudge implement` / `undrudge dismiss` lines (id already filled in)
+that close the loop. Paste it into whatever session is going to do the
+work.
+
+```bash
+undrudge copy               # pick from a list, copy the one you choose
+undrudge copy 20fc          # any unique id prefix — four characters usually do
+undrudge copy 20fc --print  # to stdout instead (pipe it, or read it here)
+undrudge copy 20fc --what path   # or: body, id
+```
+
+No id opens a one-shot picker with the same preview as `browse`, so the id
+never has to make the trip through your eyes and back into another
+terminal. With an id, prefix matching means you're typing four characters,
+not sixty-four — and an ambiguous prefix tells you so instead of guessing.
+Without a clipboard tool on PATH (`pbcopy`, `wl-copy`, `xclip`, `xsel`)
+it prints the hand-off rather than silently dropping it.
+
+This is the same idea as a dispatch brief, minus everything that only
+exists inside a synced repo clone — use `dispatch` when you want briefs
+routed to clones automatically, `copy` when you're driving.
+
+## Retention
+
+The SQLite file is a rebuildable cache over your Claude/Codex JSONL and
+atuin history, and every consumer of it reads a 24h or 7d trailing window
+— so rows older than a few weeks cost disk and buy nothing. (A few months
+of dogfooding put message text past a gigabyte here.)
+
+Each `gather` deletes ingested messages and shell commands older than the
+retention window:
+
+```toml
+[retention]
+days = 30      # 0 = keep everything
+```
+
+Recommendations are never pruned — they're the output, they're tiny, and
+their markdown bodies on disk are the durable artifact. Cursors aren't
+touched either, so pruning can never trigger a re-ingest of the history it
+just dropped rows from.
+
+```bash
+undrudge prune --dry-run     # what would go, without writing
+undrudge prune --days 14     # one-off, ignoring the configured window
+undrudge prune --vacuum      # also FTS-optimize + VACUUM, handing the
+                             # freed pages back to the filesystem
+```
+
+Deleted rows leave free pages behind that SQLite reuses but doesn't
+return to the OS, so the file only *shrinks* on `--vacuum` (which needs
+room for a second copy while it runs). A scheduled `gather` prunes at
+most 50k rows per run, so enabling retention on a long-lived DB drains
+the backlog over a few hourly runs instead of stalling one. `undrudge
+doctor` reports the file size, the policy, and any remaining backlog.
 
 ## Dispatch (optional)
 

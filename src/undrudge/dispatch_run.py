@@ -39,20 +39,7 @@ class RunResult:
 
 def _parse_frontmatter(body_path: str) -> tuple[dict, str]:
     """Pull the leading ```json fence + body from a rec markdown file."""
-    try:
-        text = Path(body_path).read_text(encoding="utf-8")
-    except OSError:
-        return {}, ""
-    if not text.startswith("```json\n"):
-        return {}, text
-    end = text.find("\n```", len("```json\n"))
-    if end < 0:
-        return {}, text
-    try:
-        fm = json.loads(text[len("```json\n"):end])
-    except json.JSONDecodeError:
-        return {}, text
-    return fm, text[end + len("\n```"):].lstrip("\n")
+    return recommend.parse_rec_file(body_path)
 
 
 class Dispatcher:
@@ -182,29 +169,7 @@ class Dispatcher:
         return [(r["id"][:12], r["title"], r["signature"]) for r in rows]
 
     def resolve_cwds(self, fm: dict) -> list[str]:
-        counts: dict[str, int] = {}
-        for ref in fm.get("evidence_refs") or []:
-            eid = "".join(c for c in str(ref.get("external_id", "")).lower()
-                          if c in "0123456789abcdef")
-            if len(eid) < 6:
-                continue
-            src = ref.get("source", "")
-            if src in ("atuin", "shell"):
-                q = ("SELECT cwd FROM commands WHERE "
-                     "replace(external_id,'-','') LIKE ? LIMIT 5")
-            elif src in ("claude", "codex", "msg", "message"):
-                q = ("SELECT s.project FROM messages m JOIN sessions s "
-                     "ON m.session_id=s.id WHERE replace(m.id,'-','') LIKE ? LIMIT 5")
-            elif src == "session":
-                q = ("SELECT project FROM sessions WHERE "
-                     "replace(id,'-','') LIKE ? LIMIT 5")
-            else:
-                continue
-            for row in self.conn.execute(q, (eid + "%",)).fetchall():
-                cwd = row[0]
-                if cwd:
-                    counts[cwd] = counts.get(cwd, 0) + 1
-        return [c for c, _ in sorted(counts.items(), key=lambda kv: -kv[1])]
+        return recommend.evidence_cwds(self.conn, fm)
 
     # ---------------------------------------------------------------- git / fs
 

@@ -199,6 +199,36 @@ def render_markdown(rec: Recommendation, *, fingerprint: str, created: datetime)
     return head + f"\n# {rec.title.strip()}\n\n{rec.body_markdown.strip()}\n"
 
 
+def parse_rec_file(body_path: str | Path | None) -> tuple[dict[str, Any], str]:
+    """Split a rec markdown file into (frontmatter, body).
+
+    Reads the current ```json fence and the legacy YAML-style ``---`` fence
+    (recs written before that change). A missing, unreadable, or malformed
+    file degrades to ``({}, whatever text was there)`` — callers render what
+    they can rather than failing on a hand-edited rec.
+    """
+    if not body_path:
+        return {}, ""
+    try:
+        text = Path(body_path).read_text(encoding="utf-8")
+    except OSError:
+        return {}, ""
+    if text.startswith("```json\n"):
+        open_len, close = len("```json\n"), "\n```"
+    elif text.startswith("---\n"):
+        open_len, close = len("---\n"), "\n---"
+    else:
+        return {}, text
+    end = text.find(close, open_len)
+    if end < 0:
+        return {}, text
+    try:
+        fm = json.loads(text[open_len:end])
+    except json.JSONDecodeError:
+        return {}, text
+    return fm, text[end + len(close):].lstrip("\n")
+
+
 def normalize(rec: Recommendation) -> Recommendation:
     """Tighten free-form LLM output to known enums and trimmed strings."""
     form = rec.automation_form.strip().lower().replace(" ", "_") if rec.automation_form else "other"
@@ -479,6 +509,106 @@ def resolve_evidence_refs(
     return (resolved, total)
 
 
+def evidence_cwds(conn: sqlite3.Connection, fm: dict[str, Any]) -> list[str]:
+    """Directories the rec's evidence came from, most-cited first.
+
+    Resolves each ``evidence_refs`` handle back to the ``cwd`` of the shell
+    command, or the ``project`` of the session, that produced it. Used to tell
+    a reader (or an implementing agent) *where* this pattern was happening.
+    """
+    counts: dict[str, int] = {}
+    for ref in fm.get("evidence_refs") or []:
+        if not isinstance(ref, dict):
+            continue
+        eid = "".join(
+            c for c in str(ref.get("external_id", "")).lower()
+            if c in "0123456789abcdef"
+        )
+        if len(eid) < 6:
+            continue
+        src = ref.get("source", "")
+        if src in ("atuin", "shell"):
+            q = ("SELECT cwd FROM commands WHERE "
+                 "replace(external_id,'-','') LIKE ? LIMIT 5")
+        elif src in ("claude", "codex", "msg", "message"):
+            q = ("SELECT s.project FROM messages m JOIN sessions s "
+                 "ON m.session_id=s.id WHERE replace(m.id,'-','') LIKE ? LIMIT 5")
+        elif src == "session":
+            q = ("SELECT project FROM sessions WHERE "
+                 "replace(id,'-','') LIKE ? LIMIT 5")
+        else:
+            continue
+        for row in conn.execute(q, (eid + "%",)).fetchall():
+            cwd = row[0]
+            if cwd:
+                counts[cwd] = counts.get(cwd, 0) + 1
+    return [c for c, _ in sorted(counts.items(), key=lambda kv: -kv[1])]
+
+
+def render_handoff(conn: sqlite3.Connection, rec: dict[str, Any]) -> str:
+    """A rec as a paste-ready hand-off for an implementing session.
+
+    The chat-shaped sibling of ``dispatch.render_brief``: same idea — the rec
+    verbatim, where its evidence came from, and the contract for closing the
+    loop — minus everything that only exists inside a synced repo clone (route,
+    branch, git log, verdict files). What you paste into an agent's chat when
+    you want *this one* built now.
+
+    The closing commands carry the id so the session can flip the status
+    itself. That's the part that keeps the analyzer honest: an implemented or
+    dismissed rec (with a reason) stops being re-proposed.
+    """
+    fm, body = parse_rec_file(rec.get("body_path"))
+    id12 = rec["id"][:12]
+    facts = []
+    for key, label in (("confidence", "confidence"),
+                       ("automation_form", "form"),
+                       ("target_scope", "scope")):
+        if fm.get(key):
+            facts.append(f"{label} {fm[key]}")
+    created = datetime.fromtimestamp(rec["created_at"] / 1000, tz=UTC)
+    facts.append(f"surfaced {created.strftime('%Y-%m-%d')}")
+
+    cwds = evidence_cwds(conn, fm)
+    where = "\n".join(f"- `{c}`" for c in cwds[:6]) or "- (no evidence locations resolved)"
+
+    parts = [
+        f"# undrudge recommendation {id12}",
+        "",
+        " · ".join(facts),
+        "",
+        f"Rec file: `{rec.get('body_path')}`",
+        "",
+        "## The recommendation (verbatim)",
+        "",
+        body.strip() or f"# {rec['title']}\n\n_(body file missing)_",
+        "",
+        "## Where the evidence came from",
+        "",
+        where,
+        "",
+        "## Before building it",
+        "",
+        "undrudge watches history, so a rec can lag the tree by days and its "
+        "evidence can be wrong. Check first:",
+        "",
+        "1. The cited files, commands, and paths exist in this tree.",
+        "2. The pain is steady-state, not a burst that already ended.",
+        "3. It isn't already solved.",
+        "",
+        "## When you're done",
+        "",
+        "```bash",
+        f'undrudge implement {id12} --reason "<what you built>"   # built it',
+        f'undrudge dismiss   {id12} --reason "<why not>"          # stale or wrong',
+        "```",
+        "",
+        "The reason feeds the analyzer's do-not-re-propose list, so it's worth "
+        "a sentence either way.",
+    ]
+    return "\n".join(parts) + "\n"
+
+
 # --------------------------------------------------------------------------
 # Listing and status mutation
 # --------------------------------------------------------------------------
@@ -529,11 +659,15 @@ class StatusUpdate:
 def find_by_id_prefix(
     conn: sqlite3.Connection, id_prefix: str
 ) -> list[dict[str, Any]]:
-    """Match a fingerprint by full id or any unique-enough prefix."""
+    """Match a fingerprint by full id or any unique-enough prefix.
+
+    Four hex characters usually resolve; the whole row comes back so callers
+    that need more than the status don't have to re-query.
+    """
     if not id_prefix:
         return []
     rows = conn.execute(
-        "SELECT id, status, body_path FROM recommendations WHERE id LIKE ?",
+        "SELECT * FROM recommendations WHERE id LIKE ?",
         (id_prefix + "%",),
     ).fetchall()
     return [dict(r) for r in rows]

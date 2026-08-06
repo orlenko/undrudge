@@ -38,6 +38,16 @@ Treat `prototype/` as reference-only unless a task explicitly targets it.
 - Preserve the product boundary: scheduled batch jobs, markdown output, and a
   human deciding what to implement. Do not add a daemon, UI, or external
   service without an explicit product decision.
+  - `undrudge browse` is the one sanctioned interactive surface (product
+    decision, 2026-07-31): an ephemeral fzf sidecar that reads the same rows
+    and files, routes every mutation through `recommend.set_status` +
+    `events.record`, and leaves no state of its own behind. Keep it that way —
+    a picker that persists its own view state, caches recs, or outlives the
+    keypress is a UI, and needs its own decision.
+- Retention (`prune`, and the capped pass at the end of `gather`) may delete
+  `messages`, `commands`, and sessions those leave empty — nothing else.
+  Recommendations are the product's output and cursors are what make re-ingest
+  idempotent; pruning either would either lose work or replay whole histories.
 - Prefer the standard library. Ask before adding a production dependency.
 
 ## Working agreement
