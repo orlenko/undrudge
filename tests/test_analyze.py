@@ -782,3 +782,120 @@ def test_reap_is_noop_on_already_dead_process(tmp_path: Path):
     # Must return cleanly without raising on an already-exited child.
     analyze._reap(proc, term_wait=0.1, kill_wait=0.1)
     assert proc.poll() is not None
+
+# --------------------------------------------------------------------------
+# Coverage watermark / catch-up window
+# --------------------------------------------------------------------------
+
+HOUR_MS = 3_600_000
+
+
+def _payload(sig: str = "sig") -> str:
+    return json.dumps([
+        {"title": "X", "body_markdown": "b", "signature": sig}
+    ])
+
+
+def test_run_records_coverage_watermark(tmp_path: Path):
+    cfg = _mk_cfg(tmp_path)
+    conn = store.init(cfg.paths.db)
+    end = store.now_ms()
+    analyze.run(conn, cfg, invoker=lambda _: _payload(), end_ts_ms=end)
+    assert analyze.covered_through(conn, "daily") == end
+    # Scopes have independent watermarks.
+    assert analyze.covered_through(conn, "weekly") is None
+
+
+def test_resolve_window_hours_default_extend_and_cap(tmp_path: Path):
+    cfg = _mk_cfg(tmp_path)
+    conn = store.init(cfg.paths.db)
+    now = store.now_ms()
+    # No watermark: scope default.
+    assert analyze.resolve_window_hours(conn, scope="daily", end_ts_ms=now) == 24
+    # Watermark 1h ago: the default is the floor.
+    analyze._record_covered(conn, "daily", now - 1 * HOUR_MS)
+    assert analyze.resolve_window_hours(conn, scope="daily", end_ts_ms=now) == 24
+    # Watermark 72h ago: extend to cover the gap.
+    analyze._record_covered(conn, "daily", now - 72 * HOUR_MS)
+    assert analyze.resolve_window_hours(conn, scope="daily", end_ts_ms=now) == 72
+    # Partial hours round up.
+    analyze._record_covered(conn, "daily", now - 30 * HOUR_MS - 1)
+    assert analyze.resolve_window_hours(conn, scope="daily", end_ts_ms=now) == 31
+    # A month-long gap is capped.
+    analyze._record_covered(conn, "daily", now - 30 * 24 * HOUR_MS)
+    assert analyze.resolve_window_hours(conn, scope="daily", end_ts_ms=now) == 7 * 24
+    # A watermark at/after end (clock skew, historical end) falls back.
+    analyze._record_covered(conn, "daily", now + HOUR_MS)
+    assert analyze.resolve_window_hours(conn, scope="daily", end_ts_ms=now) == 24
+
+
+def test_run_extends_window_back_to_watermark(tmp_path: Path):
+    cfg = _mk_cfg(tmp_path)
+    conn = store.init(cfg.paths.db)
+    now = store.now_ms()
+    analyze.run(
+        conn, cfg, invoker=lambda _: _payload("a"), end_ts_ms=now - 72 * HOUR_MS
+    )
+    analyze.run(conn, cfg, invoker=lambda _: _payload("b"), end_ts_ms=now)
+    entries = [
+        json.loads(ln) for ln in cfg.paths.events_log.read_text().splitlines()
+    ]
+    completes = [e for e in entries if e["event"] == "analyze_complete"]
+    assert [e["window_hours"] for e in completes] == [24, 72]
+    assert analyze.covered_through(conn, "daily") == now
+
+
+def test_explicit_gapped_window_does_not_advance_watermark(tmp_path: Path):
+    cfg = _mk_cfg(tmp_path)
+    conn = store.init(cfg.paths.db)
+    t0 = store.now_ms() - 48 * HOUR_MS
+    analyze.run(conn, cfg, invoker=lambda _: _payload("a"), end_ts_ms=t0)
+    # Explicit 2h window 48h later leaves a 46h gap: watermark must not move.
+    analyze.run(
+        conn, cfg, invoker=lambda _: _payload("b"),
+        window_hours=2, end_ts_ms=t0 + 48 * HOUR_MS,
+    )
+    assert analyze.covered_through(conn, "daily") == t0
+    # A contiguous explicit window (a manual backfill) does advance it.
+    analyze.run(
+        conn, cfg, invoker=lambda _: _payload("c"),
+        window_hours=48, end_ts_ms=t0 + 48 * HOUR_MS,
+    )
+    assert analyze.covered_through(conn, "daily") == t0 + 48 * HOUR_MS
+
+
+def test_dry_run_does_not_advance_watermark(tmp_path: Path):
+    cfg = _mk_cfg(tmp_path)
+    conn = store.init(cfg.paths.db)
+    analyze.run(
+        conn, cfg, invoker=lambda _: _payload(), dry_run=True,
+        workdir=tmp_path / "wd",
+    )
+    assert analyze.covered_through(conn, "daily") is None
+
+
+def test_failed_run_does_not_advance_watermark(tmp_path: Path):
+    cfg = _mk_cfg(tmp_path)
+    conn = store.init(cfg.paths.db)
+    with pytest.raises(ValueError):
+        analyze.run(
+            conn, cfg, invoker=lambda _: "not json", workdir=tmp_path / "wd"
+        )
+    assert analyze.covered_through(conn, "daily") is None
+
+
+def test_capped_catchup_still_advances_watermark(tmp_path: Path):
+    """A gap past the cap must not freeze the watermark: the capped run
+    accepts the hole and moves on, and the night after resolves back to
+    the default window."""
+    cfg = _mk_cfg(tmp_path)
+    conn = store.init(cfg.paths.db)
+    now = store.now_ms()
+    analyze._record_covered(conn, "daily", now - 30 * 24 * HOUR_MS)
+    analyze.run(conn, cfg, invoker=lambda _: _payload("a"), end_ts_ms=now)
+    assert analyze.covered_through(conn, "daily") == now
+    next_night = now + 24 * HOUR_MS
+    assert (
+        analyze.resolve_window_hours(conn, scope="daily", end_ts_ms=next_night)
+        == 24
+    )
