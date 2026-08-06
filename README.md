@@ -114,6 +114,15 @@ to the values the schedulers use. Either flag can override the preset
 (e.g. `undrudge analyze week --window 14d`). Use `analyze` with no
 preset to keep the previous default (24h regular).
 
+Missed runs heal themselves: each successful run records how far it
+covered (a cursor row per scope), and the next run without an explicit
+`--window` extends its window back to that point — capped at 7d for
+daily and 14d for weekly runs. A laptop asleep at 02:30 costs nothing
+but latency; the accumulated activity is analyzed on the next run that
+does land. An explicit `--window` is used as-is and only advances the
+coverage mark when it overlaps the previous one (so a short manual run
+can't silently mark a gap as covered).
+
 ### Verbose runs
 
 Every subcommand accepts a global `-v` / `-vv` before the command name

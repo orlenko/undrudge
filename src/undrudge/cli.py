@@ -410,9 +410,12 @@ def _cmd_set_status(args: argparse.Namespace, *, new_status: str) -> int:
 
 
 def _cmd_analyze(args: argparse.Namespace) -> int:
-    # Resolve preset -> defaults. Explicit --window / --meta override.
+    # Resolve preset -> scope. Without an explicit --window the window is
+    # the scope default extended to cover the gap since the last
+    # successful run (analyze.resolve_window_hours).
     meta = args.meta or (args.preset == "week")
-    window = args.window or ("7d" if args.preset == "week" else "24h")
+    scope = "weekly" if meta else "daily"
+    window_hours = _parse_window(args.window) if args.window else None
 
     cfg = config.load()
     conn = store.open_db(cfg.paths.db)
@@ -420,9 +423,12 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         store.apply_schema(conn)
 
         if args.prompt_only:
-            digest_md = digest.render_daily(
-                conn, window_hours=_parse_window(window)
-            )
+            hours = window_hours
+            if hours is None:
+                hours = analyze.resolve_window_hours(
+                    conn, scope=scope, end_ts_ms=store.now_ms()
+                )
+            digest_md = digest.render_daily(conn, window_hours=hours)
             recent = recommend.recent_logged(conn)
             recent_md = recommend.render_recent_for_prompt(recent)
             dismissed_md = recommend.render_dismissed_for_prompt(
@@ -431,7 +437,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             sys.stdout.write(
                 analyze.build_prompt(
                     digest_md, recent_md,
-                    scope="weekly" if meta else "daily",
+                    scope=scope,
                     dismissed_md=dismissed_md,
                 )
             )
@@ -440,8 +446,8 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         result = analyze.run(
             conn,
             cfg,
-            window_hours=_parse_window(window),
-            scope="weekly" if meta else "daily",
+            window_hours=window_hours,
+            scope=scope,
             dry_run=args.dry_run,
         )
     finally:
@@ -1020,7 +1026,9 @@ def _build_parser() -> argparse.ArgumentParser:
                            help="Weekly meta-analysis (scope=weekly).")
     p_analyze.add_argument("--window", default=None,
                            help="Trailing window: e.g. 24h, 7d. Default: 24h "
-                                "(or 7d when preset=week).")
+                                "(7d for weekly runs), extended to cover "
+                                "the gap since the last successful run "
+                                "(capped at 7d daily / 14d weekly).")
     p_analyze.add_argument("--dry-run", action="store_true",
                            help="Call the LLM but write to dry-run/ instead of recs_dir; "
                                 "skip DB rows and the on_write hook.")

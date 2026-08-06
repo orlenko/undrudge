@@ -30,13 +30,76 @@ from pathlib import Path
 
 from . import config as cfg_mod
 from . import digest as digest_mod
-from . import events, llm, recommend
+from . import events, llm, recommend, store
 
 logger = logging.getLogger(__name__)
 
 PROMPT_TEMPLATE = "analyze.md"
 TOOL_META_TEMPLATE = "tool_meta.md"
 DEFAULT_TIMEOUT = 600  # claude -p with a chunky prompt routinely needs minutes
+
+# Coverage watermark: eventual completeness for scheduled runs. The
+# launchd job fires at 02:30 whether or not the machine is awake, so a
+# failed night would otherwise leave a permanent hole — every run
+# digests a fixed trailing window and nothing ever re-covers the gap.
+# We record the end of the last successfully analyzed window in
+# ``cursors`` (one row per scope) and, when the caller passes no
+# explicit window, extend the next run back to that point. The scope
+# default stays the *minimum* so rows gather ingests late are still
+# re-covered; the cap bounds the digest when the machine has been off
+# for a long stretch (retention keeps 30d by default, well past it).
+_HOUR_MS = 3_600_000
+_WINDOW_DEFAULT_HOURS = {"daily": 24, "weekly": 168}
+_CATCHUP_CAP_HOURS = {"daily": 7 * 24, "weekly": 14 * 24}
+
+
+def _cursor_source(scope: str) -> str:
+    return f"analyze:{scope}"
+
+
+def covered_through(conn: sqlite3.Connection, scope: str) -> int | None:
+    """End ts_ms of the last successfully analyzed window, or None."""
+    row = conn.execute(
+        "SELECT position FROM cursors WHERE source = ?",
+        (_cursor_source(scope),),
+    ).fetchone()
+    return int(row[0]) if row else None
+
+
+def _record_covered(
+    conn: sqlite3.Connection, scope: str, end_ts_ms: int
+) -> None:
+    conn.execute(
+        """INSERT INTO cursors(source, position, updated_at)
+           VALUES(?, ?, ?)
+           ON CONFLICT(source) DO UPDATE
+             SET position = excluded.position,
+                 updated_at = excluded.updated_at""",
+        (_cursor_source(scope), str(end_ts_ms), store.now_ms()),
+    )
+    conn.commit()
+
+
+def resolve_window_hours(
+    conn: sqlite3.Connection, *, scope: str, end_ts_ms: int
+) -> int:
+    """Window for a run with no explicit --window: the scope default,
+    extended to cover the gap since the last successful run (capped)."""
+    default = _WINDOW_DEFAULT_HOURS.get(scope, 24)
+    mark = covered_through(conn, scope)
+    if mark is None or mark >= end_ts_ms:
+        return default
+    gap_hours = (end_ts_ms - mark + _HOUR_MS - 1) // _HOUR_MS
+    hours = max(default, gap_hours)
+    cap = _CATCHUP_CAP_HOURS.get(scope, default)
+    if hours > cap:
+        logger.warning(
+            "catch-up window %dh exceeds %dh cap; truncating — activity "
+            "older than the cap will not be analyzed",
+            hours, cap,
+        )
+        hours = cap
+    return hours
 
 
 @dataclass
@@ -411,7 +474,7 @@ def run(
     conn: sqlite3.Connection,
     cfg: cfg_mod.Config,
     *,
-    window_hours: int = 24,
+    window_hours: int | None = None,
     end_ts_ms: int | None = None,
     scope: str = "daily",
     invoker: Invoker | None = None,
@@ -424,10 +487,20 @@ def run(
     ``prompt.md``, ``response.txt``, ``stderr.log``, and per-rec ``.md``
     files. Both dry-run and real runs leave the workdir for inspection.
 
+    When ``window_hours`` is None the window is the scope default,
+    extended to cover the gap since the last successful run — see
+    ``resolve_window_hours``. An explicit value is used as-is.
+
     When ``dry_run=True``: still calls the LLM (so output is real), still
     writes per-rec markdown to the workdir, but does not insert DB rows or
     fire the on_write hook.
     """
+    end_ts_ms = end_ts_ms or store.now_ms()
+    auto_window = window_hours is None
+    if auto_window:
+        window_hours = resolve_window_hours(
+            conn, scope=scope, end_ts_ms=end_ts_ms
+        )
     logger.info(
         "analyze start: scope=%s window=%dh dry_run=%s",
         scope, window_hours, dry_run,
@@ -584,6 +657,17 @@ def run(
         },
         conn=conn,
     )
+    # (Dry runs returned above and never reach this.) Auto-resolved
+    # windows always advance the watermark: they either reach back to it
+    # or were truncated by the catch-up cap, and a capped hole is
+    # accepted by design — freezing the mark would re-analyze the full
+    # cap every night forever. Explicit --window runs advance only when
+    # contiguous, so a short manual run can't mark a gap as covered.
+    prev = covered_through(conn, scope)
+    start_ts_ms = end_ts_ms - window_hours * _HOUR_MS
+    contiguous = prev is None or start_ts_ms <= prev
+    if (prev is None or prev < end_ts_ms) and (auto_window or contiguous):
+        _record_covered(conn, scope, end_ts_ms)
     return AnalyzeResult(prompt=prompt, response=response, parsed=recs,
                          written=written, skipped=skipped,
                          refs_total=refs_total,
