@@ -23,6 +23,7 @@ from . import (
     ingest_codex,
     ingest_shell,
     llm,
+    locate,
     prune,
     recommend,
     scrub,
@@ -407,6 +408,87 @@ def _cmd_set_status(args: argparse.Namespace, *, new_status: str) -> int:
     if result.body_path:
         print(f"  {result.body_path}")
     return 0
+
+
+def _cmd_here(args: argparse.Namespace) -> int:
+    """Open recs belonging to the repo you're standing in."""
+    repo = locate.repo_at(args.dir)
+    if repo is None:
+        msg = f"not a git repository: {args.dir}"
+        if args.json:
+            print(json.dumps({
+                "error": msg, "repo": None, "candidates": [],
+                "matched": 0, "considered": 0, "unreadable": 0,
+            }, indent=2))
+        else:
+            print(f"error: {msg}", file=sys.stderr)
+        return 2
+
+    scopes = () if args.all_scopes else locate.DEFAULT_SCOPES
+    cfg = config.load()
+    conn = store.open_db(cfg.paths.db)
+    try:
+        store.apply_schema(conn)
+        result = locate.here(
+            conn, repo, scopes=scopes, limit=args.limit, status=args.status,
+        )
+    finally:
+        conn.close()
+
+    scope_label = "rec(s)" if args.all_scopes else "single-repo rec(s)"
+    if args.json:
+        print(json.dumps({
+            "repo": {
+                "root": repo.root, "name": repo.name,
+                "origin": repo.origin, "dirty": repo.dirty,
+                "dirty_reason": repo.dirty_reason,
+            },
+            "candidates": [
+                {
+                    "id": c.id, "id12": c.id12, "title": c.title,
+                    "tier": c.tier, "body_path": c.body_path,
+                    "created_at": c.created_at, "evidence_cwds": c.cwds,
+                }
+                for c in result.candidates
+            ],
+            "matched": result.matched,
+            "considered": result.considered,
+            "unreadable": result.unreadable,
+        }, indent=2))
+        return 0
+
+    print(f"repo:   {repo.name}  ({repo.origin or 'no origin'})")
+    print(f"root:   {repo.root}")
+    print(f"tree:   {repo.dirty_reason or 'clean'}")
+    if not result.candidates:
+        print(
+            f"\nno {args.status} recommendations match this repo "
+            f"({result.considered} {scope_label} considered)."
+        )
+    else:
+        shown = len(result.candidates)
+        tail = f" (showing {shown})" if shown < result.matched else ""
+        print(
+            f"\n{result.matched} of {result.considered} "
+            f"{scope_label} match this repo{tail}:\n"
+        )
+        for c in result.candidates:
+            print(f"  {c.id12}  {c.tier:<10}  {c.title}")
+            for cwd in c.cwds[:2]:
+                print(f"                          via {_shorten_home(cwd)}")
+    if result.unreadable:
+        print(
+            f"\nnote: {result.unreadable} rec file(s) had no readable "
+            "frontmatter — coverage is incomplete."
+        )
+    return 0
+
+
+def _shorten_home(p: str) -> str:
+    home = str(Path.home()).rstrip("/")
+    if p == home:
+        return "~"
+    return "~" + p[len(home):] if p.startswith(home + "/") else p
 
 
 def _cmd_analyze(args: argparse.Namespace) -> int:
@@ -1047,6 +1129,29 @@ def _build_parser() -> argparse.ArgumentParser:
                         choices=["daily", "weekly"])
     p_list.add_argument("--limit", default=200, type=int)
     p_list.set_defaults(func=_cmd_list)
+
+    p_here = sub.add_parser(
+        "here",
+        help="Show open recs belonging to the repo in this directory "
+             "(the pull side of dispatch).",
+    )
+    p_here.add_argument("--dir", default=".",
+                        help="Anchor directory. Default: cwd.")
+    p_here.add_argument("--limit", default=5, type=int,
+                        help="Max candidates to show. 0 = no limit.")
+    p_here.add_argument("--json", action="store_true",
+                        help="Machine-readable output for an agent session.")
+    p_here.add_argument(
+        "--all-scopes", action="store_true",
+        help="Include cross_cutting and agent_global recs. Off by default: "
+             "they span directories and belong to browse/copy.",
+    )
+    p_here.add_argument(
+        "--status", default="logged",
+        choices=["logged", "dismissed", "implemented", "dispatched", "rejected"],
+        help="Which recs to match. Default: logged.",
+    )
+    p_here.set_defaults(func=_cmd_here)
 
     p_browse = sub.add_parser(
         "browse",

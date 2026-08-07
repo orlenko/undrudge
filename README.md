@@ -88,6 +88,7 @@ undrudge analyze week        # weekly meta digest → recs (7d trailing, --meta)
 undrudge analyze --dry-run day    # daily run, but write to dry-run/ (skip DB+hook)
 undrudge digest --window 24h --out -   # render a digest only (no LLM call)
 undrudge list                # show recommendations
+undrudge here                # open recs belonging to the repo you're in (see below)
 undrudge browse              # triage them in a picker (fzf; see below)
 undrudge copy [<id>]         # rec → clipboard, ready to paste into an agent chat
 undrudge dismiss <id> [--reason ...]    # mark a rec dismissed (full id or unique prefix)
@@ -307,6 +308,50 @@ room for a second copy while it runs). A scheduled `gather` prunes at
 most 50k rows per run, so enabling retention on a long-lived DB drains
 the backlog over a few hourly runs instead of stalling one. `undrudge
 doctor` reports the file size, the policy, and any remaining backlog.
+
+## `undrudge here` — the pull side
+
+`dispatch` (below) pushes work into a clone and opens a session there,
+which can collide with a session already working in that directory.
+`undrudge here` is the inverse: run it *from inside* the session that's
+already there, and it tells you which open recs belong to this repo.
+
+```bash
+undrudge here                # ranked candidates for the repo in $PWD
+undrudge here --json         # same, for an agent session to consume
+undrudge here --dir ~/code/ops --limit 10
+undrudge here --all-scopes   # include cross_cutting / agent_global too
+```
+
+Matching runs off evidence, not prose. Every rec's `evidence_refs` point
+at the shell commands and agent sessions it was drawn from, and those
+rows carry the directory they were observed in — captured at ingest, so
+unlike the repo/branch labels in a digest it never goes stale. Three
+tiers, strongest first:
+
+- **`this_clone`** — evidence was observed inside this working tree.
+  Path-prefix, so it still matches when the directory is long gone (a
+  deleted worktree, a `/tmp` run).
+- **`same_repo`** — evidence came from a different checkout with the same
+  remote origin. `ops`, `ops2`, and `ops4/.qc/dev-worktrees/*` are one
+  repo in several clones; matching on the directory name would call them
+  several repos.
+- **`named`** — no evidence points here, but the rec names this repo in
+  its title. This is the tool-fix case: *"undrudge show should print the
+  rec body"* was observed in two unrelated repos, because that's where
+  the tool was being used — the fix belongs in undrudge's own tree, which
+  appears in no evidence at all. A hint, not proof; verify before acting.
+
+Only `single_repo` recs are considered by default. `cross_cutting` and
+`agent_global` ones span directories by definition, so they stay with
+`browse` + `copy` and a human deciding where they land.
+
+The command only *reports* — it changes nothing. The
+`/undrudge-apply` command is what acts on the result: it takes the top
+candidate, verifies it still applies, and either implements it behind a
+draft PR or closes it with a reason — **at most one rec per run**, and it
+refuses outright when the tree is dirty rather than branching on top of
+work in progress.
 
 ## Dispatch (optional)
 
