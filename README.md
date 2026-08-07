@@ -346,12 +346,14 @@ Only `single_repo` recs are considered by default. `cross_cutting` and
 `agent_global` ones span directories by definition, so they stay with
 `browse` + `copy` and a human deciding where they land.
 
-The command only *reports* — it changes nothing. The
-`/undrudge-apply` command is what acts on the result: it takes the top
-candidate, verifies it still applies, and either implements it behind a
-draft PR or closes it with a reason — **at most one rec per run**, and it
-refuses outright when the tree is dirty rather than branching on top of
-work in progress.
+The command only *reports* — it changes nothing, calls no LLM, and is
+safe to run inside a session that's mid-task. Acting on the result is an
+agent's job, not this repo's: point one at `undrudge here --json`, have
+it verify the top candidate still applies against the live tree, and let
+it either implement the rec or close it with `undrudge dismiss` /
+`implement` / `mark`. Two rules worth building into whatever drives it —
+**at most one rec per run**, and refuse outright when `repo.dirty` is
+true rather than branching on top of someone's work in progress.
 
 ## Dispatch (optional)
 
