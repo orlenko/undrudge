@@ -147,7 +147,14 @@ def find_similar(
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _MAX_SLUG_LEN = 60
-_VALID_FORM = {"slash_command", "script", "hook", "shell_alias", "extend_existing", "other"}
+_VALID_FORM = {
+    "slash_command", "script", "hook", "shell_alias", "extend_existing",
+    # Capability-gap recs (docs/capability-gap.md). Deliberately absent
+    # from dispatch's default gate_forms — release-note text feeds these,
+    # so they must stay out of auto-dispatch without a separate decision.
+    "adopt_capability",
+    "other",
+}
 _VALID_CONFIDENCE = {"high", "medium", "low"}
 _VALID_SCOPE = {"single_repo", "cross_cutting", "agent_global"}
 

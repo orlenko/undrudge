@@ -1,6 +1,7 @@
-# Capability gap — built-in features you aren't using
+# Capability gap — features you already have and aren't using
 
-> Design proposal, not yet implemented. Status: awaiting review.
+> Status: implemented (2026-08-10) — `src/undrudge/capabilities.py`. This
+> document is the design rationale; source and tests win disagreements.
 
 undrudge's existing thesis is *repetition*: you did the same thing seven
 times, a script could have done it once. This proposes a second thesis
@@ -15,9 +16,19 @@ repetition *is* the workaround — it looks like a well-factored habit. The
 missing input isn't in the history at all. It's in the changelog.
 
 This is deliberately **not** third-party discovery. No skill marketplaces,
-no "awesome-agents" lists, no plugin registries. The scope is the built-in
-surface of agents already installed on this machine — Claude Code and
-Codex — and nothing else.
+no "awesome-agents" lists, no plugin registries. The boundary is
+*installed*: anything already present on this machine is in scope —
+built-in features, but also plugins, skills, and MCP servers the user
+installed and then forgot. The second motivating case (2026-08-10): crit
+was installed on a judgment that it looked useful, its purpose never
+committed to memory, and it may be solving a problem still done by hand.
+
+*Installed* also includes **dormant**: first-party features that ship with
+the binary but need an explicit enablement step — an env var, a config
+key, an enable command. Third motivating case: Claude Code's `teams`
+feature, a game-changer for large tasks, sits behind exactly that kind of
+gate. Nothing gets recommended that would require fetching third-party
+code; flipping on something already shipped is fair game.
 
 ## Why the existing weekly pass can't do this
 
@@ -68,7 +79,16 @@ can't hallucinate and doesn't need the network.
 Its ceiling: `--help` shows surface, not semantics. Nothing in
 `claude --help` mentions agent-to-agent messaging, because that capability
 is a tool inside the session, not a command-line flag. Which is why source
-2 exists.
+2 exists. Nor does it mention dormant gates: the teams feature appears
+nowhere in the help output — only the generic `--betas` flag does.
+
+One more static file belongs here: the settings env block
+(`~/.claude/settings.json`). The env var *names* set there, matched
+against known gate names, tell dormant-and-off apart from
+enabled-but-unused. On this machine `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`
+is already set, so the right teams rec here is "you enabled this and never
+used it" — the crit shape again. Names only; values never leave the
+comparison and are never persisted.
 
 ### 2. Live probe — asking the installed build what it can do
 
@@ -89,11 +109,29 @@ token tells the analyzer nothing; `SendMessage — send a message to another
 running agent session` is what lets it connect the capability to a
 hand-rolled messaging skill in the digest.
 
-Cost: one extra LLM call, which is why it's version-gated (see *Cadence*).
-Weakness: the probe is generative, so its output wobbles between runs.
-Treat probe rows as lower-confidence than help rows, and never let a
-single probe's omission mark a capability as removed — only the static
-surface may retire a row.
+The probe enumerates everything the session exposes: built-in tools,
+plugin skills, user skills, MCP tools. All of it is in scope —
+installed-but-forgotten is exactly the crit case — and names carry their
+own provenance (`mcp__` prefixes, `plugin:skill` colons), so no filtering
+pass is needed. Run the probe from a fixed neutral directory (the user's
+home) so the surface is stable between runs; project-scoped skills that
+only load inside a given repo stay invisible to it. Accepted.
+
+The probe has a second structural blind spot: it enumerates the *active*
+surface. A dormant feature never appears in a probe, because the session
+being probed doesn't have it enabled. Dormant rows come from the help
+scrape (a `--betas`-style flag, a settings key) and from release notes —
+the one category where notes are the primary source rather than the
+narrative layer.
+
+Cost: one LLM call per day (see *Cadence*). Weakness: the probe is
+generative, so its output wobbles between runs. Treat probe rows as
+lower-confidence than help rows, and never let a single probe's omission
+mark a capability as removed. Help rows retire when a help scrape drops
+them; probe rows retire only after three consecutive probes fail to
+mention them — one flaky enumeration must not cycle a row through
+retirement and rebirth, but an uninstalled plugin must eventually stop
+generating recs.
 
 ### 3. Usage inventory — already in the database
 
@@ -115,8 +153,9 @@ a feature you have never once used" (the actual product).
 Sources 1–3 are local, offline, and self-contained. They catch anything
 that is a flag, a subcommand, or a named tool. They miss everything that
 is prose: hook behavior changed, a default flipped, a setting gained a
-mode, a limit was lifted. Those are real drudgery-removers and they leave
-no fingerprint on the local surface.
+mode, a limit was lifted, a feature shipped dormant behind an env var.
+Those are real drudgery-removers and they leave no fingerprint on the
+local surface.
 
 Catching them means fetching upstream release notes. **This crosses an
 invariant** — `docs/design.md` opens with "no external services" and
@@ -145,9 +184,15 @@ The constraints:
 - **Opt-out is a config line, and honest about what it turns off.**
   `[capabilities] fetch_release_notes = true` (default true; setting it
   false leaves the local sources fully functional).
-- **Only entries above the installed version are read.** The changelog is
-  truncated to versions newer than what the user had at last snapshot,
-  then hard-capped by byte count before it goes anywhere near a prompt.
+- **A one-time backfill, then incremental.** The teams case proves
+  incremental-only fails: teams shipped in 2.1.32, this machine runs
+  2.1.225, and "only entries above the installed version" would skip the
+  announcement forever. So the first runs walk the entire changelog in
+  byte-capped chunks — one chunk per daily run, a cursor recording
+  progress, the same eventual-completeness watermark pattern `analyze`
+  already uses — until history has been seen once. After that, only
+  entries above the last-seen version are read. Every chunk is hard-capped
+  by byte count before it goes anywhere near a prompt.
 
 Configured per provider, with the upstream public changelogs as defaults
 and the URL overridable (air-gapped users can point at a file:// mirror,
@@ -201,6 +246,11 @@ recommendation. The motivating case passes: `SendMessage` is available,
 appears nowhere in `tool_name`, and the digest shows a hand-rolled
 messaging skill invoked repeatedly across sessions.
 
+A dormant row that gaps produces a rec whose body includes the enablement
+step — the env var, the command — since "use X" is not actionable while X
+is off. A gate the settings env block shows already flipped ranks higher:
+enabled-but-unused is the strongest evidence of forgetting.
+
 ## Storage
 
 A new table, rows not blobs, so `first_seen` survives and "new since you
@@ -215,9 +265,11 @@ CREATE TABLE IF NOT EXISTS capabilities (
   description  TEXT,
   source       TEXT NOT NULL,        -- 'help' | 'probe' | 'notes'
   version      TEXT,                 -- build the row was first observed in
+  gate         TEXT,                 -- env var / command that enables it, if dormant-capable
   first_seen   INTEGER NOT NULL,
   last_seen    INTEGER NOT NULL,
-  retired_at   INTEGER,              -- set only when a *help* scrape drops it
+  retired_at   INTEGER,              -- help scrape drop, or 3 consecutive probe absences
+  probe_misses INTEGER NOT NULL DEFAULT 0,
   UNIQUE(provider, kind, name)
 );
 ```
@@ -246,21 +298,27 @@ convention.
 
 ## Cadence
 
-The user's framing was "daily check." The correction the implementation
-should encode: **the capability surface changes on version bump, not on a
-clock.**
+Daily, as the user framed it. **Decision (2026-08-10, product owner): one
+probe call a day is acceptable cost.** The wider installed-surface scope
+also makes the clock necessary: a plugin install or a new MCP server
+changes the surface with no `claude` version bump, so a version gate would
+miss exactly the crit case. Only the surfaces that change on release stay
+version-gated:
 
 - Each `gather` runs `claude --version` / `codex --version` — cheap,
   local, no LLM.
-- Version unchanged → nothing else happens. No probe, no fetch, no cost.
-- Version changed → scrape help, run the probe, fetch notes above the old
-  version, upsert rows.
-- `analyze day` consumes whatever is pending. Daily cadence as asked, but
-  a quiet week costs zero LLM calls and produces no repeat recommendations.
+- Version changed → scrape help, fetch notes above the old version,
+  upsert rows.
+- Probe: once per day regardless of version, through the existing LLM
+  path. It rides `analyze day` (which already spawns claude daily) so
+  `gather` stays LLM-free on its hourly cadence.
+- `analyze day` consumes whatever is pending, then advances a consumption
+  cursor — even when the LLM proposed nothing, since re-offering the same
+  rows every morning is the chatty-feature-list failure mode. Dedupe by
+  signature keeps a stable surface from producing repeat recommendations.
 
-A `--force` escape hatch on the subcommand for the case where the user
-wants a re-probe without a version bump (a probe that returned garbage, a
-config change, plain curiosity).
+A `--force` escape hatch on the subcommand for an immediate re-probe (a
+probe that returned garbage, a config change, plain curiosity).
 
 ## Surfaces
 
@@ -269,15 +327,15 @@ config change, plain curiosity).
 | `src/undrudge/capabilities.py` | new: scrape, probe, fetch, diff, upsert |
 | `src/undrudge/prompts/capability_gap.md` | new: the narrow gap question, appended like `tool_meta_section` |
 | `schema.sql` + `store._migrate` | `capabilities` table, fresh + upgrade |
-| `gather` | version check; refresh on bump; failure-isolated per provider |
-| `analyze` | inject the gap section when rows are pending |
-| `doctor` | provider versions, last probe age, fetch reachability, pending gap count |
-| `events.jsonl` | `capability_refresh`, `capability_new`, `capability_fetch_failed` |
+| `gather` | version check; scrape + notes on bump; no LLM; failure-isolated per provider |
+| `analyze` | daily probe, then inject the gap section when rows are pending |
+| `doctor` | provider versions, last probe age, backfill progress, pending gap count |
+| `events.jsonl` | `capability_refresh` (carries new-row names), `capability_scrape_failed`, `capability_fetch_failed`, `capability_probe_failed` |
 | `cli.py` | `undrudge capabilities [--force] [--show]` for manual inspection |
 | `config.toml` | `[capabilities]` block |
 | `README.md` | operator docs, per the "user-visible sources change together" rule |
 
-New `automation_form` value: `adopt_builtin`. Note that
+New `automation_form` value: `adopt_capability`. Note that
 `dispatch_run.gate_forms` filters on this field — the new value must stay
 *out* of any auto-dispatch gate by default, for the injection reason
 above.
@@ -290,7 +348,7 @@ enabled             = true
 probe               = true   # the live `claude -p` capability probe
 fetch_release_notes = true   # the one network call; false → local only
 fetch_timeout_s     = 10
-max_notes_bytes     = 200_000
+max_notes_bytes     = 200_000  # per run; also the backfill chunk size
 # Per-provider overrides; file:// accepted for mirrors and air-gapped hosts.
 # [capabilities.claude]  release_notes_url = "..."
 # [capabilities.codex]   release_notes_url = "..."
@@ -306,9 +364,9 @@ max_notes_bytes     = 200_000
   evidence bar, not filtering titles.
 - **Probe output is generative and wobbles.** Mitigated by never letting a
   probe retire a row, and by ranking probe rows below help rows.
-- **Version-gating means a feature that ships without a version bump is
-  invisible** (server-side rollouts, gradual enablement). Accepted;
-  release notes partially cover it.
+- **Version-gating the help scrape means a flag that ships without a
+  version bump is invisible until the next bump.** The daily probe covers
+  in-session capabilities regardless; release notes cover the rest.
 - **Two providers, one prompt.** Codex and Claude capabilities are not
   interchangeable, and a rec must name which agent it applies to. The
   existing `target_scope: agent_global` language already assumes
@@ -332,7 +390,7 @@ max_notes_bytes     = 200_000
   inspectable by eye, and where we find out whether the signal is any good
   before spending more.
 - **Phase 2 — the probe.** Live capability enumeration via the existing
-  LLM path, version-gated, failure-isolated.
+  LLM path, daily, failure-isolated.
 - **Phase 3 — the gap prompt.** `capability_gap.md`, wired into `analyze`
   behind `--dry-run` until the recs read well.
 - **Phase 4 — release notes.** The network source, its injection
@@ -342,7 +400,10 @@ max_notes_bytes     = 200_000
 
 ## Non-goals
 
-- Third-party skills, plugins, MCP servers, marketplaces. Built-in only.
+- Discovery of things not installed: marketplaces, registries,
+  awesome-lists. Installed plugins, skills, and MCP servers are in scope;
+  recommending new ones to install is not. Dormant first-party features
+  count as installed.
 - Notifying on *every* new feature. No pain in the digest, no rec.
 - Auto-adopting a capability, or auto-dispatching a capability rec.
 - Tracking capabilities of agents not installed on this machine.

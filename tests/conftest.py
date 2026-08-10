@@ -12,6 +12,17 @@ from fixtures import ANTHROPIC_KEY, GITHUB_TOKEN, GITHUB_TOKEN_FAKE_REPEATED
 from undrudge import store
 
 
+@pytest.fixture(autouse=True)
+def _no_real_capability_refresh(monkeypatch):
+    """Capability refresh shells out to the real claude/codex binaries and
+    (with config defaults) fetches a changelog over the network. No test may
+    do either. An absent binary makes refresh a per-provider no-op, so stub
+    discovery to "absent"; capability tests re-patch this explicitly."""
+    from undrudge import capabilities
+
+    monkeypatch.setattr(capabilities, "binary_version", lambda binary: None)
+
+
 @pytest.fixture
 def db(tmp_path: Path) -> sqlite3.Connection:
     conn = store.init(tmp_path / "undrudge.sqlite")
