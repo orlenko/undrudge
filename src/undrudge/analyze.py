@@ -16,6 +16,7 @@ substitute a pure-Python mock without touching subprocess.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import re
@@ -28,6 +29,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
+from . import capabilities as capabilities_mod
 from . import config as cfg_mod
 from . import digest as digest_mod
 from . import events, llm, recommend, store
@@ -135,6 +137,7 @@ def build_prompt(
     *,
     scope: str = "daily",
     dismissed_md: str = "_(no recently dismissed recommendations)_",
+    capability_section: str = "",
 ) -> str:
     tpl = load_prompt_template()
     # Tool meta-analysis is a weekly-only pass: per-pattern friction
@@ -147,6 +150,7 @@ def build_prompt(
         .replace("{recent_recs}", recent_recs_md)
         .replace("{dismissed_recs}", dismissed_md)
         .replace("{tool_meta_section}", meta)
+        .replace("{capability_gap_section}", capability_section)
     )
 
 
@@ -505,6 +509,23 @@ def run(
         "analyze start: scope=%s window=%dh dry_run=%s",
         scope, window_hours, dry_run,
     )
+    # Capability inventory rides the daily run: the probe is the one LLM
+    # call gather refuses to make, and analyze already spawns claude daily.
+    # Failure-isolated — a broken probe or a borked capabilities table must
+    # never cost the day's analysis.
+    capability_section = ""
+    cap_offered_ts = 0
+    if cfg.capabilities.enabled and scope == "daily":
+        try:
+            if not dry_run:
+                capabilities_mod.refresh(conn, cfg, with_probe=True)
+            # Snapshot the offer time before rendering: rows a concurrent
+            # gather inserts while the LLM runs must stay "new" for the
+            # next run, not get swallowed by a later consumption mark.
+            cap_offered_ts = store.now_ms()
+            capability_section = capabilities_mod.render_gap_section(conn, cfg)
+        except Exception:
+            logger.exception("capability refresh/render failed; continuing")
     digest_md = digest_mod.render_daily(
         conn, end_ts_ms=end_ts_ms, window_hours=window_hours
     )
@@ -513,7 +534,8 @@ def run(
     dismissed = recommend.recent_dismissed(conn)
     dismissed_md = recommend.render_dismissed_for_prompt(dismissed)
     prompt = build_prompt(
-        digest_md, recent_md, scope=scope, dismissed_md=dismissed_md
+        digest_md, recent_md, scope=scope, dismissed_md=dismissed_md,
+        capability_section=capability_section,
     )
     logger.info(
         "prompt assembled: digest=%d chars, recent_recs=%d chars, "
@@ -642,6 +664,13 @@ def run(
         "analyze done: parsed=%d written=%d skipped=%d",
         len(recs), len(written), skipped,
     )
+    if capability_section:
+        # The gap rows offered this run are no longer "new". Advance even
+        # when the LLM proposed nothing — no pain, no rec is the designed
+        # outcome, and re-offering the same rows every morning is the
+        # chatty-feature-list failure mode.
+        with contextlib.suppress(sqlite3.Error):
+            capabilities_mod.mark_consumed(conn, now_ms=cap_offered_ts)
     events.record(
         cfg.paths.events_log,
         "analyze_complete",

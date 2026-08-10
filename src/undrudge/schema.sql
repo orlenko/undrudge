@@ -99,6 +99,25 @@ CREATE TABLE IF NOT EXISTS cursors (
   updated_at   INTEGER NOT NULL
 );
 
+-- Installed-capability inventory (docs/capability-gap.md). Rows, not blobs,
+-- so first_seen survives and "new since last looked" is a query. Never
+-- pruned: this is memory of the same kind cursors are, and it is tiny.
+CREATE TABLE IF NOT EXISTS capabilities (
+  id           TEXT PRIMARY KEY,     -- sha256(provider|kind|name)
+  provider     TEXT NOT NULL,        -- 'claude' | 'codex'
+  kind         TEXT NOT NULL,        -- flag|subcommand|tool|skill|command|note
+  name         TEXT NOT NULL,
+  description  TEXT,
+  source       TEXT NOT NULL,        -- 'help' | 'probe' | 'notes'
+  version      TEXT,                 -- build the row was first observed in
+  gate         TEXT,                 -- env var/command that enables it, if dormant-capable
+  first_seen   INTEGER NOT NULL,
+  last_seen    INTEGER NOT NULL,
+  retired_at   INTEGER,              -- help scrape drop, or 3 consecutive probe absences
+  probe_misses INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(provider, kind, name)
+);
+
 CREATE TABLE IF NOT EXISTS redaction_failures (
   id           INTEGER PRIMARY KEY,
   ts           INTEGER NOT NULL,

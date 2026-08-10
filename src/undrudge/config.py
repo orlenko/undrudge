@@ -79,6 +79,34 @@ class Privacy:
     fail_loud: bool = True
 
 
+# Upstream public changelogs. Overridable per provider; file:// URLs are
+# accepted so air-gapped hosts can point at a mirror.
+DEFAULT_NOTES_URLS: dict[str, str] = {
+    "claude": "https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md",
+    "codex": "https://raw.githubusercontent.com/openai/codex/main/CHANGELOG.md",
+}
+
+
+@dataclass
+class Capabilities:
+    """Installed-capability inventory (docs/capability-gap.md).
+
+    ``fetch_release_notes`` is the one network call undrudge makes — a
+    bare conditional GET of a public changelog, carrying no local state
+    (product decision 2026-08-09). Setting it false leaves the local
+    sources (help scrape, probe, usage inventory) fully functional.
+    """
+
+    enabled: bool = True
+    probe: bool = True   # the live capability probe (one LLM call per day)
+    fetch_release_notes: bool = True
+    fetch_timeout_s: int = 10
+    max_notes_bytes: int = 200_000  # per run; also the backfill chunk size
+    release_notes_urls: dict[str, str] = field(
+        default_factory=lambda: dict(DEFAULT_NOTES_URLS)
+    )
+
+
 @dataclass
 class Retention:
     """How long ingested rows stay in the query cache.
@@ -105,6 +133,7 @@ class Config:
     output: Output = field(default_factory=Output)
     privacy: Privacy = field(default_factory=Privacy)
     retention: Retention = field(default_factory=Retention)
+    capabilities: Capabilities = field(default_factory=Capabilities)
 
 
 def default_config() -> Config:
@@ -169,6 +198,27 @@ def load(path: Path | None = None) -> Config:
     if "retention" in raw:
         rt = raw["retention"]
         cfg.retention = Retention(days=max(int(rt.get("days", cfg.retention.days)), 0))
+    if "capabilities" in raw:
+        cap = raw["capabilities"]
+        urls = dict(cfg.capabilities.release_notes_urls)
+        for provider in list(urls):
+            sub = cap.get(provider)
+            if isinstance(sub, dict) and "release_notes_url" in sub:
+                urls[provider] = str(sub["release_notes_url"])
+        cfg.capabilities = Capabilities(
+            enabled=bool(cap.get("enabled", cfg.capabilities.enabled)),
+            probe=bool(cap.get("probe", cfg.capabilities.probe)),
+            fetch_release_notes=bool(
+                cap.get("fetch_release_notes", cfg.capabilities.fetch_release_notes)
+            ),
+            fetch_timeout_s=int(
+                cap.get("fetch_timeout_s", cfg.capabilities.fetch_timeout_s)
+            ),
+            max_notes_bytes=int(
+                cap.get("max_notes_bytes", cfg.capabilities.max_notes_bytes)
+            ),
+            release_notes_urls=urls,
+        )
     return cfg
 
 
@@ -235,4 +285,20 @@ fail_loud = true
 # would remove, and `undrudge prune --vacuum` to hand the freed pages back to
 # the filesystem.
 days = {cfg.retention.days}
+
+[capabilities]
+# Installed-capability inventory: what your agents can do vs what you use
+# (docs/capability-gap.md). `undrudge capabilities --show` prints the gap.
+enabled             = true
+probe               = true   # live capability probe — one LLM call per day
+# The one network call: a bare conditional GET of the provider's public
+# changelog, carrying no local state. false = local sources only.
+fetch_release_notes = true
+fetch_timeout_s     = {cfg.capabilities.fetch_timeout_s}
+max_notes_bytes     = {cfg.capabilities.max_notes_bytes}  # per run; also the backfill chunk size
+# Per-provider overrides; file:// accepted for mirrors and air-gapped hosts.
+# [capabilities.claude]
+# release_notes_url = "{DEFAULT_NOTES_URLS['claude']}"
+# [capabilities.codex]
+# release_notes_url = "{DEFAULT_NOTES_URLS['codex']}"
 """

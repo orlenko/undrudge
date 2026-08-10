@@ -16,6 +16,7 @@ from . import (
     __version__,
     analyze,
     browse,
+    capabilities,
     config,
     digest,
     events,
@@ -145,6 +146,10 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
             for t in ("sessions", "messages", "commands", "recommendations",
                       "cursors", "redaction_failures"):
                 check(f"table {t}", t in tables)
+            # Informational only: a pre-upgrade DB gains this table on the
+            # next gather's apply_schema; that hour must not FAIL doctor.
+            if "capabilities" not in tables:
+                print("  [--] table capabilities — pending next gather/init")
             failures = conn.execute(
                 "SELECT COUNT(*) FROM redaction_failures"
             ).fetchone()[0]
@@ -158,7 +163,62 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     print("\ngather:")
     _check_gather_health(cfg, check)
 
+    print("\ncapabilities:")
+    _report_capabilities(cfg)
+
     return 0 if ok else 1
+
+
+def _report_capabilities(cfg: config.Config) -> None:
+    """Informational capability-inventory status. Not pass/fail: a missing
+    provider binary or an offline notes fetch is a normal state."""
+    if not cfg.capabilities.enabled:
+        print("  [--] disabled in config")
+        return
+    if not cfg.paths.db.exists():
+        print("  [--] no db yet")
+        return
+    try:
+        conn = store.open_db(cfg.paths.db)
+    except sqlite3.DatabaseError as e:
+        print(f"  [--] db unreadable — {e}")
+        return
+    try:
+        now = store.now_ms()
+        for provider in capabilities.PROVIDERS:
+            state = capabilities.load_state(conn, provider)
+            if not state:
+                print(f"  [--] {provider}: no snapshot yet (gather has not seen it)")
+                continue
+            active = conn.execute(
+                "SELECT COUNT(*) FROM capabilities WHERE provider=? "
+                "AND retired_at IS NULL", (provider,),
+            ).fetchone()[0]
+            probed_at = int(state.get("probed_at") or 0)
+            probe_age = (
+                f"{(now - probed_at) / 3_600_000:.0f}h ago" if probed_at
+                else "never"
+            )
+            notes = state.get("notes") or {}
+            notes_note = (
+                "backfill done" if notes.get("done")
+                else f"backfill at {notes.get('lo', '—')}" if notes
+                else "no notes yet"
+            )
+            print(
+                f"  [--] {provider}: version {state.get('version', '?')}, "
+                f"{active} active rows, probe {probe_age}, {notes_note}"
+            )
+        consumed = capabilities.consumed_through(conn)
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM capabilities WHERE retired_at IS NULL "
+            "AND first_seen > ?", (consumed,),
+        ).fetchone()[0]
+        print(f"  [--] {pending} row(s) not yet offered to analyze")
+    except sqlite3.Error as e:
+        print(f"  [--] query failed — {e}")
+    finally:
+        conn.close()
 
 
 def _report_retention(cfg: config.Config, conn: sqlite3.Connection) -> None:
@@ -516,11 +576,16 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             dismissed_md = recommend.render_dismissed_for_prompt(
                 recommend.recent_dismissed(conn)
             )
+            cap_md = ""
+            if cfg.capabilities.enabled and scope == "daily":
+                with contextlib.suppress(Exception):
+                    cap_md = capabilities.render_gap_section(conn, cfg)
             sys.stdout.write(
                 analyze.build_prompt(
                     digest_md, recent_md,
                     scope=scope,
                     dismissed_md=dismissed_md,
+                    capability_section=cap_md,
                 )
             )
             return 0
@@ -612,6 +677,7 @@ def _cmd_gather(_args: argparse.Namespace) -> int:
     x: ingest_codex.CodexIngestStats | None = None
     s: ingest_shell.ShellIngestStats | None = None
     p: prune.PruneStats | None = None
+    cap_results: list[capabilities.ProviderRefresh] = []
     prune_error: BaseException | None = None
     failures: list[tuple[str, BaseException]] = []
     gather_logger = logging.getLogger("undrudge.gather")
@@ -654,6 +720,17 @@ def _cmd_gather(_args: argparse.Namespace) -> int:
             except Exception as e:
                 prune_error = e
                 gather_logger.exception("prune failed")
+
+        # Capability inventory: version-gated help scrape + notes fetch,
+        # no LLM (the probe rides the daily analyze instead). Never fatal
+        # and never a "source" — an offline laptop is a normal state, not
+        # a broken gather. refresh() records its own events.
+        if cfg.capabilities.enabled:
+            try:
+                cap_results = capabilities.refresh(conn, cfg, with_probe=False)
+            except Exception:
+                cap_results = []
+                gather_logger.exception("capability refresh failed")
     finally:
         conn.close()
 
@@ -686,6 +763,19 @@ def _cmd_gather(_args: argparse.Namespace) -> int:
         print(f"  rows inserted       : {s.rows_inserted}")
         print(f"  rows dropped        : {s.rows_dropped}")
         print(f"  last ts (ns)        : {s.last_ts_ns}")
+
+    refreshed = [
+        r for r in cap_results if r.new_rows or r.retired_rows or r.errors
+    ]
+    if refreshed:
+        print("\ncapabilities:")
+        for r in refreshed:
+            print(
+                f"  {r.provider:6}: {r.new_rows} new, {r.retired_rows} retired "
+                f"(version {r.version})"
+            )
+            for err in r.errors:
+                print(f"  {r.provider:6}  note: {err}")
 
     if p is not None:
         print()
@@ -891,6 +981,59 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     return dispatch_run.cmd_dispatch(cfg, subcmd=args.subcmd, dry=args.dry_run)
 
 
+def _cmd_capabilities(args: argparse.Namespace) -> int:
+    """Refresh and/or inspect the installed-capability inventory."""
+    cfg = config.load()
+    conn = store.open_db(cfg.paths.db)
+    try:
+        store.apply_schema(conn)
+        if not (args.show and not args.force):
+            results = capabilities.refresh(
+                conn, cfg, force=args.force, with_probe=True
+            )
+            for r in results:
+                if r.skipped_reason:
+                    print(f"{r.provider}: skipped — {r.skipped_reason}")
+                    continue
+                changed = " (changed)" if r.version_changed else ""
+                print(
+                    f"{r.provider}: version {r.version}{changed} — "
+                    f"{r.new_rows} new, {r.updated_rows} refreshed, "
+                    f"{r.retired_rows} retired, probe {r.probed} row(s), "
+                    f"notes {r.notes_entries} entr(ies)"
+                )
+                for err in r.errors:
+                    print(f"  note: {err}")
+        if args.show:
+            print()
+            _show_capability_gap(conn, cfg)
+    finally:
+        conn.close()
+    return 0
+
+
+def _show_capability_gap(conn: sqlite3.Connection, cfg: config.Config) -> None:
+    rows = capabilities.gap_rows(conn, cfg)
+    total = conn.execute(
+        "SELECT COUNT(*) FROM capabilities WHERE retired_at IS NULL"
+    ).fetchone()[0]
+    if not total:
+        print("(no capability rows yet — run `undrudge capabilities` after "
+              "installing claude/codex, or wait for the next gather)")
+        return
+    print(f"{total} active capability row(s); {len(rows)} never used:\n")
+    for g in rows:
+        marker = "NEW " if g.is_new else "    "
+        desc = f" — {g.description}" if g.description else ""
+        gate = ""
+        if g.gate and g.gate_enabled:
+            gate = f"  [gate {g.gate}: enabled, unused]"
+        elif g.gate:
+            gate = f"  [dormant: requires {g.gate}]"
+        line = f"  {marker}[{g.provider} {g.kind}] {g.name}{desc}{gate}"
+        print(line[:160])
+
+
 def _cmd_scrub(args: argparse.Namespace) -> int:
     """Re-apply current secret redaction over stored command text.
 
@@ -1066,6 +1209,22 @@ def _build_parser() -> argparse.ArgumentParser:
              "flipping statuses, or touching the vault.",
     )
     p_dispatch.set_defaults(func=_cmd_dispatch)
+
+    p_cap = sub.add_parser(
+        "capabilities",
+        help="Refresh/inspect the installed-capability inventory "
+             "(what your agents can do vs what you actually use).",
+    )
+    p_cap.add_argument(
+        "--force", action="store_true",
+        help="Re-scrape, re-probe, and re-fetch even without a version bump.",
+    )
+    p_cap.add_argument(
+        "--show", action="store_true",
+        help="Print the gap (available, never used). Alone: display only, "
+             "no refresh.",
+    )
+    p_cap.set_defaults(func=_cmd_capabilities)
 
     p_scrub = sub.add_parser(
         "scrub",

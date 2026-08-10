@@ -97,6 +97,7 @@ undrudge mark <id> <status> [--reason ...]   # set any status: dispatched, rejec
 undrudge prune [--dry-run] [--vacuum]   # apply retention to the db (see below)
 undrudge dispatch run [--dry-run]    # route logged recs to repo clones as briefs (see below)
 undrudge dispatch status             # show logged recs + their dispatch state
+undrudge capabilities [--show] [--force]  # installed-capability inventory (see below)
 ```
 
 A recommendation moves through these statuses: `logged` (freshly
@@ -308,6 +309,53 @@ room for a second copy while it runs). A scheduled `gather` prunes at
 most 50k rows per run, so enabling retention on a long-lived DB drains
 the backlog over a few hourly runs instead of stalling one. `undrudge
 doctor` reports the file size, the policy, and any remaining backlog.
+
+## Capability gap — features you already have and aren't using
+
+Repetition analysis can't catch one class of drudgery: a hand-rolled
+workaround for a feature your agent already ships. The workaround *is*
+the repetition — it looks like a well-factored habit. So undrudge also
+keeps an inventory of what the installed agents can do, compares it
+against what your history shows you actually use, and offers the gap to
+the daily analyzer (design: `docs/capability-gap.md`). Four sources:
+
+- **Help scrape** — `claude --help` / `codex --help` plus one level of
+  subcommand help, re-parsed when the binary version changes. Free,
+  local, can't hallucinate.
+- **Live probe** — once a day the analyzer asks a real session to
+  enumerate its own tools, skills, and slash commands. This is what
+  finds in-session capabilities (and installed-then-forgotten plugins,
+  skills, and MCP servers) that no help text mentions. One extra LLM
+  call per day; probe rows retire after three consecutive absences, so
+  an uninstalled plugin stops generating suggestions.
+- **Usage inventory** — the `tool_name` column, slash-command prompts,
+  and shell commands already in the DB are the "what you actually use"
+  half. Costs nothing.
+- **Release notes** — the provider's public changelog. This is the one
+  network call undrudge makes: a bare conditional GET of a public file,
+  carrying no local state, degrading silently to local-only when
+  offline. On first run it backfills the whole changelog in byte-capped
+  daily chunks (a cursor tracks progress), then reads only entries above
+  the last-seen version. Notes are what catch *dormant* features —
+  shipped behind an env var or enable command, invisible to every local
+  source. Set `fetch_release_notes = false` under `[capabilities]` to
+  turn it off, or point `release_notes_url` at a `file://` mirror.
+
+Capability recs flow through the same pipeline as everything else —
+same dedupe, same triage, same dismissal feedback. Their signature is
+capability-derived (`adopt:claude:tool:SendMessage`), so dismissing one
+silences that capability for good. A capability with no matching pain in
+the digest produces no rec at all; the gap list is offered once and not
+re-offered every morning.
+
+```bash
+undrudge capabilities --show     # print the current gap, no refresh
+undrudge capabilities            # refresh (scrape/fetch/probe as due)
+undrudge capabilities --force    # re-scrape + re-probe + re-fetch now
+```
+
+`undrudge doctor` reports per-provider versions, probe age, and backfill
+progress under `capabilities:`.
 
 ## `undrudge here` — the pull side
 
