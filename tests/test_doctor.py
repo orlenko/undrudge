@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from undrudge import cli, store
 from undrudge import config as cfg_mod
 
@@ -46,6 +48,13 @@ def _run_check(cfg: cfg_mod.Config) -> list[tuple[str, bool, str]]:
 
     cli._check_gather_health(cfg, check)
     return results
+
+
+def _run_health_json(cfg, monkeypatch, capsys) -> dict:
+    store.init(cfg.paths.db).close()
+    monkeypatch.setattr(cfg_mod, "load", lambda path=None: cfg)
+    assert cli.main(["health", "--json"]) == 0
+    return json.loads(capsys.readouterr().out)
 
 
 def test_history_sources_expose_missing_codex_when_claude_exists(tmp_path: Path):
@@ -127,6 +136,73 @@ def test_doctor_missing_events_log(tmp_path: Path):
     [(_, cond, detail)] = _run_check(cfg)
     assert cond is False
     assert "not created" in detail or "not " in detail
+
+
+def test_doctor_and_health_ignore_partial_non_utf8_tail(
+    tmp_path: Path, monkeypatch, capsys
+):
+    cfg = _cfg(tmp_path)
+    now = store.now_ms()
+    valid = json.dumps({
+        "ts": now - 1000,
+        "event": "gather_complete",
+        "failed_sources": ["shell"],
+    }).encode()
+    cfg.paths.events_log.write_bytes(valid + b"\n{\"ts\": 200, \"event\": \"\xff")
+
+    [(_, doctor_ok, detail)] = _run_check(cfg)
+    health_payload = _run_health_json(cfg, monkeypatch, capsys)
+
+    assert doctor_ok is False
+    assert "shell" in detail
+    assert health_payload["latest"]["gather"]["failed_sources"] == ["shell"]
+    assert health_payload["malformed_lines"] == 1
+
+
+def test_doctor_and_health_choose_latest_timestamp_not_last_appended(
+    tmp_path: Path, monkeypatch, capsys
+):
+    cfg = _cfg(tmp_path)
+    now = store.now_ms()
+    # The newest clean completion is intentionally written first. A reducer
+    # that silently uses append order would let the older failed run win.
+    _write_events(cfg, [
+        {"ts": now - 1000, "event": "gather_complete", "failed_sources": []},
+        {"ts": now - 4000, "event": "gather_failed", "source": "shell"},
+        {"ts": now - 3000, "event": "gather_complete", "failed_sources": ["shell"]},
+    ])
+
+    [(_, doctor_ok, detail)] = _run_check(cfg)
+    health_payload = _run_health_json(cfg, monkeypatch, capsys)
+
+    assert doctor_ok is True
+    assert "transient" in detail or "self-healed" in detail
+    assert health_payload["latest"]["gather"]["failed_sources"] == []
+
+
+@pytest.mark.parametrize(
+    "terminal_fields",
+    [{"failed_sources": "shell"}, {}],
+    ids=["string", "missing"],
+)
+def test_doctor_and_health_do_not_treat_unknown_terminal_shape_as_clean(
+    terminal_fields, tmp_path: Path, monkeypatch, capsys
+):
+    cfg = _cfg(tmp_path)
+    now = store.now_ms()
+    _write_events(cfg, [{
+        "ts": now - 1000,
+        "event": "gather_complete",
+        **terminal_fields,
+    }])
+
+    [(_, doctor_ok, detail)] = _run_check(cfg)
+    health_payload = _run_health_json(cfg, monkeypatch, capsys)
+
+    assert doctor_ok is False
+    assert "unknown" in detail
+    assert health_payload["latest"]["gather"]["failed_sources"] == ["unknown"]
+    assert health_payload["window"]["gather_failed_runs"] == 1
 
 
 def test_gather_emits_gather_complete(

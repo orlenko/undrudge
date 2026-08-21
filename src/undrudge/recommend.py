@@ -220,6 +220,11 @@ def parse_rec_file(body_path: str | Path | None) -> tuple[dict[str, Any], str]:
         text = Path(body_path).read_text(encoding="utf-8")
     except OSError:
         return {}, ""
+    return parse_rec_text(text)
+
+
+def parse_rec_text(text: str) -> tuple[dict[str, Any], str]:
+    """Split already-read recommendation markdown into metadata and body."""
     if text.startswith("```json\n"):
         open_len, close = len("```json\n"), "\n```"
     elif text.startswith("---\n"):

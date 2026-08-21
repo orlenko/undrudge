@@ -20,6 +20,7 @@ from . import (
     config,
     digest,
     events,
+    health,
     ingest_claude,
     ingest_codex,
     ingest_shell,
@@ -279,29 +280,20 @@ def _check_gather_health(cfg: config.Config, check) -> None:
         return
 
     cutoff_ms = store.now_ms() - 24 * 3600 * 1000
-    last_complete: dict | None = None
-    transient_failures = 0
+    gather_summary = health.GatherReducer(cutoff_ms=cutoff_ms)
     try:
-        with log.open(encoding="utf-8") as fp:
-            for line in fp:
-                try:
-                    e = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if e.get("ts", 0) < cutoff_ms:
-                    continue
-                event = e.get("event")
-                if event == "gather_complete":
-                    last_complete = e
-                elif event == "gather_failed":
-                    transient_failures += 1
+        for event in health.iter_events(log):
+            if event is not None:
+                gather_summary.add(event)
     except OSError as e:
         check("events log readable", False, str(e))
         return
 
     # Old DBs predate gather_complete: fall back to "any failure in 24h"
     # rather than claim health we can't prove.
-    if last_complete is None:
+    latest = gather_summary.outcome
+    transient_failures = gather_summary.failure_events
+    if latest is None or latest["legacy_failure"]:
         if transient_failures:
             check("last gather run healthy", False,
                   f"{transient_failures} failure(s) in 24h; "
@@ -311,7 +303,7 @@ def _check_gather_health(cfg: config.Config, check) -> None:
                   "no failures in 24h (no gather_complete event yet)")
         return
 
-    failed_now = last_complete.get("failed_sources") or []
+    failed_now = latest["failed_sources"]
     if failed_now:
         check("last gather run healthy", False,
               f"latest run still failing: {', '.join(failed_now)}")
@@ -402,8 +394,7 @@ def _cmd_mark(args: argparse.Namespace) -> int:
 
 
 def _cmd_show(args: argparse.Namespace) -> int:
-    """Print the absolute path of the rec's markdown file. Cmd+click in
-    iTerm2 (or pipe to your viewer of choice) takes it from there."""
+    """Print a recommendation's markdown body, or its path with ``--path``."""
     cfg = config.load()
     conn = store.open_db(cfg.paths.db)
     try:
@@ -430,7 +421,159 @@ def _cmd_show(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    print(body_path)
+    if args.path:
+        print(body_path)
+        return 0
+
+    path = Path(body_path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        print(
+            f"recommendation {matches[0]['id'][:12]} body file is missing: {path}",
+            file=sys.stderr,
+        )
+        return 1
+    except UnicodeError:
+        print(
+            f"recommendation {matches[0]['id'][:12]} body file is not valid UTF-8: {path}",
+            file=sys.stderr,
+        )
+        return 1
+    except OSError:
+        print(
+            f"recommendation {matches[0]['id'][:12]} body file could not be read: {path}",
+            file=sys.stderr,
+        )
+        return 1
+    _, body = recommend.parse_rec_text(text)
+    sys.stdout.write(body)
+    if body and not body.endswith("\n"):
+        sys.stdout.write("\n")
+    return 0
+
+
+def _format_health_time(ts_ms: int, *, now_ms: int) -> str:
+    stamp = datetime.fromtimestamp(ts_ms / 1000, tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+    elapsed = max(0, now_ms - ts_ms)
+    if elapsed < 60_000:
+        age = "<1m ago"
+    elif elapsed < 3_600_000:
+        age = f"{elapsed // 60_000}m ago"
+    elif elapsed < 86_400_000:
+        age = f"{elapsed // 3_600_000}h ago"
+    else:
+        age = f"{elapsed // 86_400_000}d ago"
+    return f"{stamp} ({age})"
+
+
+def _cmd_health(args: argparse.Namespace) -> int:
+    """Report durable pipeline outcomes without mutating the DB or audit log."""
+    cfg = config.load()
+    log = cfg.paths.events_log
+    if not log.exists():
+        print(f"events log not found: {log} (gather/analyze have not run)", file=sys.stderr)
+        return 1
+
+    now_ms = store.now_ms()
+    cutoff_ms = _parse_since(args.since)
+    assert cutoff_ms is not None  # argparse always supplies the 7d default
+    try:
+        summary = health.summarize_events(log, cutoff_ms=cutoff_ms)
+    except OSError as e:
+        print(f"could not read events log {log}: {e}", file=sys.stderr)
+        return 1
+
+    status_counts: dict[str, int] | None = None
+    status_error: str | None = None
+    try:
+        status_counts = health.current_status_counts(
+            cfg.paths.db, created_since_ms=cutoff_ms
+        )
+    except sqlite3.Error:
+        status_error = "recommendation DB unavailable or incompatible"
+
+    if args.json:
+        print(json.dumps({
+            "generated_at_ms": now_ms,
+            "since": args.since,
+            "cutoff_ms": cutoff_ms,
+            **summary,
+            "current_recommendations": status_counts,
+            "current_recommendations_error": status_error,
+        }, indent=2))
+        return 0
+
+    print(f"pipeline outcomes (activity since {args.since})")
+    gather = summary["latest"]["gather"]
+    if gather is None:
+        print("gather:         never recorded")
+    else:
+        if gather["legacy_failure"]:
+            outcome = "failed (legacy event; no gather_complete)"
+        elif gather["failed_sources"]:
+            outcome = "failing: " + ", ".join(gather["failed_sources"])
+        else:
+            outcome = "clean"
+        rows = ", ".join(
+            f"{source} {count}"
+            for source, count in gather["rows"].items()
+            if count is not None
+        )
+        suffix = f"; rows {rows}" if rows else ""
+        print(
+            "gather:         "
+            f"{_format_health_time(gather['ts'], now_ms=now_ms)} — {outcome}{suffix}"
+        )
+
+    print("analyze (last successful):")
+    analyze_outcomes = summary["latest"]["analyze"]
+    scopes = ["daily", "weekly", *sorted(set(analyze_outcomes) - {"daily", "weekly"})]
+    for scope in scopes:
+        outcome = analyze_outcomes[scope]
+        if outcome is None:
+            print(f"  {scope:10} never recorded")
+            continue
+        counts = ", ".join(
+            f"{outcome[key]} {label}"
+            for key, label in (
+                ("parsed", "parsed"),
+                ("written", "written"),
+                ("skipped", "duplicate"),
+            )
+            if outcome[key] is not None
+        )
+        suffix = f" — {counts}" if counts else ""
+        print(
+            f"  {scope:10} "
+            f"{_format_health_time(outcome['ts'], now_ms=now_ms)}{suffix}"
+        )
+
+    if status_counts is None:
+        print(f"recommendations: {status_error}")
+    else:
+        print("recommendations (surfaced in window, current status):")
+        print("  " + ", ".join(f"{name} {count}" for name, count in status_counts.items()))
+
+    window = summary["window"]
+    print(
+        f"window totals:   gather runs {window['gather_runs']} "
+        f"({window['gather_failed_runs']} failed), "
+        f"recommendations written {window['recommendations_written']}"
+    )
+    for scope in scopes:
+        totals = window["analyze"].get(scope)
+        if totals is None or not totals["runs"]:
+            continue
+        print(
+            f"  analyze {scope}: {totals['runs']} runs, {totals['parsed']} parsed, "
+            f"{totals['written']} written, {totals['skipped']} duplicate"
+        )
+    failures = window["failures"]
+    failure_text = ", ".join(f"{name} {count}" for name, count in failures.items())
+    print(f"recorded failures: {failure_text or 'none'}")
+    if summary["malformed_lines"]:
+        print(f"malformed event lines ignored: {summary['malformed_lines']}")
     return 0
 
 
@@ -1191,6 +1334,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_doctor = sub.add_parser("doctor", help="Check paths, histories, atuin, and LLM CLI.")
     p_doctor.set_defaults(func=_cmd_doctor)
 
+    p_health = sub.add_parser(
+        "health",
+        help="Summarize pipeline outcomes from the events audit log.",
+    )
+    p_health.add_argument(
+        "--since", default="7d",
+        help="Count activity and failures since this point (e.g. 24h, 7d, 2026-08-01).",
+    )
+    p_health.add_argument("--json", action="store_true", help="Machine-readable output.")
+    p_health.set_defaults(func=_cmd_health)
+
     p_gather = sub.add_parser("gather", help="Ingest Claude, Codex, and shell activity.")
     p_gather.set_defaults(func=_cmd_gather)
 
@@ -1410,9 +1564,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_show = sub.add_parser(
         "show",
-        help="Print the absolute path of a rec's markdown file.",
+        help="Print a recommendation's markdown body.",
     )
     p_show.add_argument("id", help="Full id or unique prefix.")
+    p_show.add_argument(
+        "--path", action="store_true",
+        help="Print the absolute markdown-file path instead of its body.",
+    )
     p_show.set_defaults(func=_cmd_show)
 
     return p

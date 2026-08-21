@@ -50,6 +50,7 @@ previews); every other command runs without them.
 undrudge init                # create ~/.config/undrudge/config.toml,
                              # ~/.local/share/undrudge/, and the SQLite db
 undrudge doctor              # sanity-check histories, atuin, and the LLM CLI
+undrudge health              # pipeline outcomes from the durable audit log
 ```
 
 Edit `~/.config/undrudge/config.toml` to point at your atuin DB, Claude
@@ -88,6 +89,8 @@ undrudge analyze week        # weekly meta digest → recs (7d trailing, --meta)
 undrudge analyze --dry-run day    # daily run, but write to dry-run/ (skip DB+hook)
 undrudge digest --window 24h --out -   # render a digest only (no LLM call)
 undrudge list                # show recommendations
+undrudge show <id>           # print one recommendation's markdown body
+undrudge show <id> --path    # print its absolute file path instead
 undrudge here                # open recs belonging to the repo you're in (see below)
 undrudge browse              # triage them in a picker (fzf; see below)
 undrudge copy [<id>]         # rec → clipboard, ready to paste into an agent chat
@@ -140,6 +143,15 @@ Verbose is the *transient* "what's happening right now" channel. The
 durable history channel is the JSONL audit trail at
 `~/.local/share/undrudge/events.jsonl` — that records rec writes,
 status changes, and analyze runs regardless of `-v`.
+
+`undrudge health [--since 7d] [--json]` turns that trail into a stable
+pipeline summary: the latest gather outcome, the latest successful daily
+and weekly analyses, windowed totals, current statuses of recommendations
+surfaced in the window, and recorded failures. Last-run lines scan the full
+audit trail so a stale run remains visible; totals use the requested window.
+Unlike `doctor`, which checks whether the environment is wired correctly,
+`health` reports outcomes. It streams the event log and opens the SQLite cache
+read-only; it does not change either one.
 
 If a scheduled run misses (laptop asleep, Claude API blip, you closed
 the lid), running these by hand replays them. Recs are deduplicated by
