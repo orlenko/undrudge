@@ -57,8 +57,10 @@ Treat `prototype/` as reference-only unless a task explicitly targets it.
 2. Read the parser, schema, digest, config/CLI, and their tests together when a
    change crosses an ingestion boundary.
 3. Use focused tests while iterating. Before handoff run:
-   - `UV_CACHE_DIR=.uv-cache uv run ruff check .`
-   - `UV_CACHE_DIR=.uv-cache uv run pytest -q`
+   - `uv run ruff check .`
+   - `uv run pytest -q`
+   The repo-level uv configuration keeps its cache in `.uv-cache`; no
+   `UV_CACHE_DIR` prefix is needed for commands run from this project.
 4. Do not run `undrudge gather` or `undrudge analyze` against the user's default
    histories as routine verification. Use synthetic fixtures and isolated
    config/data directories.

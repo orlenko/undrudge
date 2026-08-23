@@ -55,6 +55,9 @@ dev = [
   "ruff>=0.5",
 ]
 
+[tool.uv]
+cache-dir = ".uv-cache"
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
