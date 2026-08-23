@@ -218,7 +218,7 @@ def parse_rec_file(body_path: str | Path | None) -> tuple[dict[str, Any], str]:
         return {}, ""
     try:
         text = Path(body_path).read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeError):
         return {}, ""
     return parse_rec_text(text)
 
@@ -626,7 +626,8 @@ def render_handoff(conn: sqlite3.Connection, rec: dict[str, Any]) -> str:
 # --------------------------------------------------------------------------
 
 
-_VALID_STATUS = {"logged", "dismissed", "implemented", "dispatched", "rejected"}
+STATUS_ORDER = ("logged", "dispatched", "implemented", "dismissed", "rejected")
+_VALID_STATUS = set(STATUS_ORDER)
 
 
 def list_recs(
@@ -652,11 +653,43 @@ def list_recs(
     if scope:
         sql.append("AND scope = ?")
         args.append(scope)
-    sql.append("ORDER BY created_at DESC LIMIT ?")
-    args.append(limit)
+    sql.append("ORDER BY created_at DESC, id")
+    if limit > 0:
+        sql.append("LIMIT ?")
+        args.append(limit)
 
     rows = conn.execute(" ".join(sql), args).fetchall()
     return [dict(r) for r in rows]
+
+
+def public_rec(row: dict[str, Any]) -> dict[str, Any]:
+    """Stable, privacy-bounded representation used by machine consumers.
+
+    Deliberately omit the signature and evidence columns. They are analysis
+    inputs, not part of the recommendation-listing contract, and can contain
+    fragments derived from private activity.
+    """
+    rec_id = str(row["id"])
+    fm, _body = parse_rec_file(row.get("body_path"))
+    if not isinstance(fm, dict):
+        fm = {}
+    confidence = fm.get("confidence")
+    if not isinstance(confidence, str) or confidence not in _VALID_CONFIDENCE:
+        confidence = None
+    target_scope = fm.get("target_scope")
+    if not isinstance(target_scope, str) or target_scope not in _VALID_SCOPE:
+        target_scope = None
+    return {
+        "id": rec_id,
+        "id12": rec_id[:12],
+        "title": str(row["title"]),
+        "status": str(row["status"]),
+        "scope": str(row["scope"]),
+        "confidence": confidence,
+        "target_scope": target_scope,
+        "created_at": int(row["created_at"]),
+        "updated_at": int(row["updated_at"]),
+    }
 
 
 @dataclass

@@ -29,6 +29,21 @@ def open_db(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def open_db_readonly(path: Path) -> sqlite3.Connection:
+    """Open an existing WAL store without creating, migrating, or writing it.
+
+    ``mode=rw`` lets SQLite safely coordinate the WAL sidecars; ``query_only``
+    rejects data and schema mutations on this connection. A true ``mode=ro``
+    handle can fail transiently when the last writer recreates ``-wal``/``-shm``.
+    """
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=rw", uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA query_only = ON")
+    return conn
+
+
 def apply_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(schema_sql())
     _migrate(conn)

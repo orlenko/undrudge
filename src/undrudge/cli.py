@@ -27,6 +27,7 @@ from . import (
     llm,
     locate,
     prune,
+    rec_stats,
     recommend,
     scrub,
     store,
@@ -362,6 +363,10 @@ def _cmd_list(args: argparse.Namespace) -> int:
     finally:
         conn.close()
 
+    if args.json:
+        print(json.dumps([recommend.public_rec(row) for row in rows], indent=2))
+        return 0
+
     if not rows:
         print("(no recommendations)")
         return 0
@@ -374,6 +379,32 @@ def _cmd_list(args: argparse.Namespace) -> int:
         scope = f"{r['scope']:6}"
         title = r["title"][:80]
         print(f"{date}  {short}  {status} {scope} {title}")
+    return 0
+
+
+def _cmd_stats(args: argparse.Namespace) -> int:
+    cfg = config.load()
+    try:
+        conn = store.open_db_readonly(cfg.paths.db)
+    except sqlite3.Error as exc:
+        print(f"recommendation DB unavailable: {exc}", file=sys.stderr)
+        return 1
+    try:
+        try:
+            result = rec_stats.recommendation_stats(conn)
+        except sqlite3.Error as exc:
+            print(f"recommendation DB incompatible: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+
+    print(f"recommendations: {result.total}")
+    print("status:")
+    for status, count in result.by_status.items():
+        print(f"  {status:<11} {count}")
+    print("scope:")
+    for scope, count in result.by_scope.items():
+        print(f"  {scope:<11} {count}")
     return 0
 
 
@@ -1440,8 +1471,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_list.add_argument("--scope", default=None,
                         choices=["daily", "weekly"])
-    p_list.add_argument("--limit", default=200, type=int)
+    p_list.add_argument("--limit", default=200, type=int,
+                        help="Maximum rows. 0 = no limit. Default: 200.")
+    p_list.add_argument("--json", action="store_true",
+                        help="Machine-readable recommendation list.")
     p_list.set_defaults(func=_cmd_list)
+
+    p_stats = sub.add_parser(
+        "stats",
+        help="Count recommendations by status and analysis scope.",
+    )
+    p_stats.set_defaults(func=_cmd_stats)
 
     p_here = sub.add_parser(
         "here",

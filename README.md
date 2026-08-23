@@ -89,6 +89,8 @@ undrudge analyze week        # weekly meta digest → recs (7d trailing, --meta)
 undrudge analyze --dry-run day    # daily run, but write to dry-run/ (skip DB+hook)
 undrudge digest --window 24h --out -   # render a digest only (no LLM call)
 undrudge list                # show recommendations
+undrudge list --json         # stable machine-readable recommendation rows
+undrudge stats               # aggregate counts by status and analysis scope
 undrudge show <id>           # print one recommendation's markdown body
 undrudge show <id> --path    # print its absolute file path instead
 undrudge here                # open recs belonging to the repo you're in (see below)
@@ -113,6 +115,15 @@ prompt under "do not re-propose variants", and the write-time dedupe
 gate suppresses near-duplicates of them. So dismissing a rec with a
 reason like *"we don't want a background daemon"* stops the analyzer
 from re-proposing rephrasings of that idea.
+
+`undrudge list --json` emits the filtered list as JSON without local paths,
+signatures, evidence, transcripts, or commands. It includes `confidence` and
+`target_scope` when readable from recommendation frontmatter, or `null` when
+that metadata is unavailable. Pass `--limit 0` for the full inventory.
+`undrudge stats` is the durable, read-only aggregate view: it prints fixed-order
+counts by recommendation status and analysis scope (`daily` / `weekly`) without
+depending on private SQLite schema knowledge or on evidence rows that retention
+may prune.
 
 `day` and `week` are convenience presets — they set `--window`/`--meta`
 to the values the schedulers use. Either flag can override the preset
