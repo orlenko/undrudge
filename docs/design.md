@@ -314,9 +314,9 @@ home = "~/.codex"  # scans sessions/ and archived_sessions/
 db = "~/.local/share/atuin/history.db"
 
 [llm]
-# `@bundled` (default) → use the claude-sandboxed.sh wrapper shipped inside
-# the package. Wraps claude under `nono` if installed; falls through to bare
-# `claude` otherwise. Override with an absolute path or "claude" to disable.
+# `@bundled` (default) → use the claude-headless.sh wrapper shipped inside
+# the package. Runs claude with the headless flags analyze needs.
+# Override with an absolute path or "claude" to disable.
 command         = "@bundled"
 model           = "claude-sonnet-4-6"
 max_tokens      = 8000
@@ -382,8 +382,8 @@ laptop-friendly catch-up scheduling.
   `tests/test_sanitize.py` before running against real data.
 - **uv invocation example**: `uv run undrudge gather` from repo root, or
   `uv tool install .` then `undrudge gather`.
-- **Bundled `claude-sandboxed.sh`** lives at
-  `src/undrudge/scripts/claude-sandboxed.sh`. The `[llm].command` config
+- **Bundled `claude-headless.sh`** lives at
+  `src/undrudge/scripts/claude-headless.sh`. The `[llm].command` config
   defaults to the sentinel `@bundled` which `undrudge.llm.resolve_command`
-  turns into the on-disk path. The script auto-detects `nono`; if it's
-  absent, claude runs unwrapped. No external repos required.
+  turns into the on-disk path. It exec's `claude` with fixed headless
+  flags. No external repos required.

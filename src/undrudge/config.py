@@ -254,8 +254,8 @@ home = "{cfg.codex.home if cfg.codex else _expand('~/.codex')}"
 db = "{cfg.atuin.db}"
 
 [llm]
-# `@bundled` (default) uses the claude-sandboxed.sh wrapper shipped with
-# undrudge — runs claude under nono if available, otherwise bare claude.
+# `@bundled` (default) uses the claude-headless.sh wrapper shipped with
+# undrudge — runs claude with the headless flags analyze needs.
 # Override with an absolute path to your own wrapper, or with `claude` to
 # disable any wrapping.
 command         = "{cfg.llm.command}"

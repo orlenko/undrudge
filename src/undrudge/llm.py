@@ -3,9 +3,9 @@
 Resolves the configured ``[llm].command`` to a concrete argv. Two modes:
 
 - ``"@bundled"`` (default): use the wrapper script shipped with this package.
-  The wrapper runs Claude under ``nono`` if available, else exec's bare
-  ``claude``. Means undrudge ships everything it needs to call Claude in a
-  reasonable sandbox without external repos.
+  The wrapper exec's ``claude`` with the headless flags analyze needs.
+  Means undrudge ships everything it needs to call Claude without
+  external repos.
 - Anything else: treated as a literal command, resolved via ``shutil.which``.
   Useful for users who already have their own wrapper (e.g.
   ``/path/to/your-claude-wrapper.sh``) or want to point at bare ``claude``.
@@ -22,13 +22,13 @@ BUNDLED_SENTINEL = "@bundled"
 
 
 def bundled_wrapper_path() -> Path:
-    """Filesystem path to the bundled ``claude-sandboxed.sh`` wrapper.
+    """Filesystem path to the bundled ``claude-headless.sh`` wrapper.
 
     Resolved via ``importlib.resources``; works whether undrudge is
     installed normally or run from source. The path is a real on-disk
     file (the wrapper is a plain script, not zipped).
     """
-    ref = files("undrudge").joinpath("scripts/claude-sandboxed.sh")
+    ref = files("undrudge").joinpath("scripts/claude-headless.sh")
     with as_file(ref) as p:  # context manager safe for any backend
         # When `as_file` returns a path under a temp dir for zipped installs,
         # we'd need to keep the context open. Hatch ships flat files, so the

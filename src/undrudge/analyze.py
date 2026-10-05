@@ -183,8 +183,8 @@ class FileBasedInvoker:
     timeout: int = DEFAULT_TIMEOUT
     poll_interval: float = 2.0
     # Teardown grace: SIGTERM then, if the child ignores it, SIGKILL.
-    # A child can ignore SIGTERM when wedged in an interactive nono prompt
-    # after writing its marker — see _reap.
+    # A child can ignore SIGTERM when wedged after writing its marker —
+    # see _reap.
     term_wait: float = 5.0
     kill_wait: float = 5.0
 
@@ -213,10 +213,8 @@ class FileBasedInvoker:
         )
 
         with stderr_file.open("wb") as err_fp:
-            # cwd matters: the bundled nono wrapper grants `--allow-cwd`,
-            # and launchd starts agents in `/` by default. Without an
-            # explicit cwd nono would be asked to allow `/`, which it
-            # refuses because it overlaps `~/.nono`.
+            # Run in the per-call workdir, not launchd's default `/`, so
+            # anything claude writes relative to cwd stays in the run dir.
             proc = subprocess.Popen(
                 [*self.command_argv, "-p", instruction],
                 stdout=subprocess.DEVNULL,
@@ -243,9 +241,8 @@ class FileBasedInvoker:
                         # claude writes response.txt and *then* the marker,
                         # so a present marker means the response is on disk
                         # — even if claude is still alive, e.g. blocked on
-                        # an interactive nono "review denied paths" prompt
-                        # that only appears post-run and that nobody answers
-                        # in a headless invocation. A hung child must never
+                        # a post-run prompt that nobody answers in a
+                        # headless invocation. A hung child must never
                         # discard a run that already succeeded.
                         response = (
                             response_file.read_text()
@@ -294,8 +291,7 @@ def _reap(
 
     The child can outlive its marker: claude writes ``response.txt`` and
     ``done.marker`` and *then*, instead of exiting, can block on an
-    interactive nono "review denied paths" prompt that nobody will answer
-    in a headless ``-p`` run. SIGTERM may not reap it promptly, so we
+    interactive prompt that nobody will answer in a headless ``-p`` run. SIGTERM may not reap it promptly, so we
     escalate to SIGKILL — and swallow every error. By the time we reap,
     the caller has already captured the authoritative result from
     ``response.txt``, so teardown must never turn a successful run into a

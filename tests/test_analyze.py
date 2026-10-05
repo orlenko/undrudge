@@ -716,7 +716,7 @@ def test_run_handles_malformed_response(tmp_path: Path):
 # Invoker teardown: a child that lingers after the marker must not crash the
 # run nor discard its result. Regression for the real-world failure where
 # claude wrote response.txt + done.marker, then blocked on an interactive
-# nono prompt that ignored SIGTERM — the old unwrapped proc.wait raised and
+# sandbox prompt that ignored SIGTERM — the old unwrapped proc.wait raised and
 # threw away a finished 222s analysis.
 # --------------------------------------------------------------------------
 

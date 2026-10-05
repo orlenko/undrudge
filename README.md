@@ -478,27 +478,14 @@ If your environment uses a secret type that isn't covered, add a pattern to
 `src/undrudge/sanitize.py` and a synthetic case under `tests/` *before* running
 `undrudge gather` against real data.
 
-## Sandboxed Claude (optional)
+## Claude wrapper
 
 `[llm].command` in the config points at whatever wraps `claude -p` for
-you. The default `@bundled` resolves to `scripts/claude-sandboxed.sh`,
-which runs claude under [`nono`](https://github.com/always-further/nono)
-if installed and falls through to bare `claude` if not. Override with
-an absolute path to your own wrapper, or with `claude` to disable
-wrapping entirely.
-
-If you do use the bundled wrapper with nono ≥ 0.48, install the
-`claude` pack once:
-
-```bash
-nono pull always-further/claude
-```
-
-The wrapper invokes `--profile claude`. Older nono (< 0.48) shipped
-this profile as the built-in `claude-code` and didn't need a pack
-pull. The pack is also where the inter-process lock file
-`~/.claude.lock` is granted; if you ever see a nono "Refusing to grant"
-error on that path, the pack is missing or out of date.
+you. The default `@bundled` resolves to `scripts/claude-headless.sh`,
+which runs claude with `--dangerously-skip-permissions
+--no-session-persistence`. Override with an absolute path to your own
+wrapper (for example one that adds a sandbox), or with `claude` to
+disable wrapping entirely.
 
 ## Dev shortcuts
 

@@ -128,9 +128,6 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     except FileNotFoundError as e:
         check(f"llm.command ({cfg.llm.command})", False, str(e))
 
-    nono_bin = shutil.which("nono")
-    check("nono on PATH (optional)", nono_bin is not None,
-          nono_bin or "not installed; bundled wrapper will fall through to bare claude")
     claude_bin = shutil.which("claude")
     check("claude on PATH", claude_bin is not None,
           claude_bin or "not found")
